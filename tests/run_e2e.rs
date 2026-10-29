@@ -155,3 +155,37 @@ fn run_reports_unresolvable_import_with_exit_one() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn run_resolves_import_map_alias_against_config_root() {
+    // 配置在根、入口在子目录：@app/ 映射应相对配置目录解析，而非引用者目录；
+    // 同时覆盖别名省略扩展名与带扩展名两种写法。
+    let dir = unique_dir("importmap");
+    std::fs::write(
+        dir.join("mio.json"),
+        "{ \"imports\": { \"@app/\": \"./src/\" } }",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(
+        dir.join("src/math.ts"),
+        "export const add = (a: number, b: number): number => a + b;\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/label.ts"), "export const tag = 'ok';\n").unwrap();
+    std::fs::write(
+        dir.join("sub/entry.ts"),
+        "import { add } from '@app/math';\n\
+         import { tag } from '@app/label.ts';\n\
+         console.log(add(2, 3), tag);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("sub/entry.ts").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "别名导入应成功：{output:?}");
+    assert_eq!(stdout.trim(), "5 ok");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

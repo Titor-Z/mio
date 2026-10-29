@@ -19,6 +19,7 @@ use boa_engine::{Context, JsError, JsObject, JsValue, NativeFunction, Source, js
 
 use super::loader::TsModuleLoader;
 use super::{Engine, EngineError};
+use crate::resolver::ModuleResolver;
 use crate::transpiler::{TranspileConfig, Transpiler};
 
 /// Boa 引擎包装。持有唯一的活动 [`Context`] 与共享的模块加载器。
@@ -36,7 +37,15 @@ impl Default for BoaEngine {
 impl BoaEngine {
     /// 构造引擎：装配带转译加载器的 `Context`，并注入最小可观测全局（`console.log`）。
     pub fn new() -> Self {
-        let loader = Rc::new(TsModuleLoader::default());
+        Self::with_resolver(ModuleResolver::default())
+    }
+
+    /// 使用给定解析器（携带 Import Maps 与基准目录）构造引擎。
+    ///
+    /// 命令行将 `mio.json` 的 `imports` 映射与配置目录装配成 [`ModuleResolver`] 传入，
+    /// 使别名导入在运行时生效。
+    pub fn with_resolver(resolver: ModuleResolver) -> Self {
+        let loader = Rc::new(TsModuleLoader::new(resolver));
         let mut context = Context::builder()
             .module_loader(loader.clone())
             .build()

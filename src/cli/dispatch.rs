@@ -41,7 +41,7 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
             Ok(())
         }
         Command::Task { name } => run_task(config, name.as_deref()),
-        Command::Run { path } => run_file(path),
+        Command::Run { path } => run_file(path, config),
         Command::Eval { source } => eval_source(source),
         Command::Repl => Err(not_implemented("repl")),
         Command::Check { path } => Err(not_implemented(&format!("check {}", path.display()))),
@@ -49,8 +49,15 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
 }
 
 /// 执行一个源码文件：读取 → 转译擦除类型 → 以 ES Module 语义求值。
-fn run_file(path: &std::path::Path) -> CliResult {
-    BoaEngine::new()
+///
+/// `mio.json` 的 `imports` 与配置目录会组装为 [`ModuleResolver`]，传给引擎后
+/// 内部的 `TsModuleLoader` 就能识别 Import Maps 别名与基准目录。
+fn run_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
+    let resolver = config
+        .config
+        .build_resolver()?
+        .with_base(config.root_dir.clone());
+    BoaEngine::with_resolver(resolver)
         .eval_module_file(path)
         .map(|_| ())
         .map_err(|error| error.to_string())

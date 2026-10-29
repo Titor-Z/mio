@@ -26,6 +26,14 @@ pub struct TsModuleLoader {
 }
 
 impl TsModuleLoader {
+    /// 用指定解析器构造加载器（解析器携带 Import Maps 与基准目录）。
+    pub fn new(resolver: ModuleResolver) -> Self {
+        Self {
+            cache: RefCell::new(rustc_hash::FxHashMap::default()),
+            resolver,
+        }
+    }
+
     /// 把已经解析好的模块预填入缓存，用于入口模块：让后续 import 命中同一实例，
     /// 也让入口文件被自己间接 import 时避免二次转译。
     pub fn register(&self, path: PathBuf, module: Module) {

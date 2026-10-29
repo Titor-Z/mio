@@ -10,6 +10,12 @@
 //! - Import Maps 中的前缀映射与精确映射
 //!
 //! 不支持 node_modules 查找、package.json 入口推断与 CommonJS 识别。
+//!
+//! 两条解析路径需严格区分，这是 Import Maps 语义的关键：
+//! - **命中映射**：Import Maps 的目标地址按规范相对**基准目录**（配置文件所在目录）解析。
+//! - **未命中映射**：说明符按书写者意图，相对**引用者文件**所在目录解析。
+//!
+//! 二者基准不同，混淆会让别名导入指向错误位置。
 
 mod specifier;
 
@@ -52,13 +58,15 @@ impl From<io::Error> for ResolveError {
     }
 }
 
-/// 模块解析器：持有 Import Maps 与扩展名补全规则，负责产出磁盘路径。
+/// 模块解析器：持有 Import Maps、基准目录与扩展名补全规则，负责产出磁盘路径。
 #[derive(Debug, Default)]
 pub struct ModuleResolver {
     /// 精确映射：说明符 → 目标说明符。
     exact: rustc_hash::FxHashMap<String, String>,
     /// 前缀映射：说明符前缀 → 目标前缀，键值均以 `/` 结尾。
     prefix: Vec<(String, String)>,
+    /// Import Maps 目标相对解析的基准目录（通常是配置文件所在目录）。
+    base: PathBuf,
 }
 
 impl ModuleResolver {
@@ -72,12 +80,19 @@ impl ModuleResolver {
         self.prefix.push((from.into(), to.into()));
     }
 
-    /// 按 Import Maps 规则重写说明符；无匹配时原样返回。
+    /// 设定 Import Maps 目标相对解析的基准目录，返回自身以便链式调用。
+    #[must_use]
+    pub fn with_base(mut self, base: PathBuf) -> Self {
+        self.base = base;
+        self
+    }
+
+    /// 命中映射时返回重写后的目标地址，否则返回 `None`。
     ///
-    /// 精确映射优先于前缀映射，前缀映射按最长前缀优先，与规范一致。
-    pub fn rewrite(&self, specifier: &str) -> String {
+    /// 精确映射优先于前缀映射，前缀映射按最长前缀优先，与 Import Maps 规范一致。
+    fn matched(&self, specifier: &str) -> Option<String> {
         if let Some(target) = self.exact.get(specifier) {
-            return target.clone();
+            return Some(target.clone());
         }
 
         let mut best: Option<(&str, &str)> = None;
@@ -91,37 +106,30 @@ impl ModuleResolver {
             }
         }
 
-        match best {
-            Some((from, to)) => format!("{}{}", to, &specifier[from.len()..]),
-            None => specifier.to_string(),
-        }
+        best.map(|(from, to)| format!("{}{}", to, &specifier[from.len()..]))
+    }
+
+    /// 按 Import Maps 规则重写说明符；无匹配时原样返回。
+    pub fn rewrite(&self, specifier: &str) -> String {
+        self.matched(specifier)
+            .unwrap_or_else(|| specifier.to_string())
     }
 
     /// 把说明符解析为磁盘上的实际文件绝对路径。
     ///
-    /// 步骤：Import Maps 重写 → 相对/绝对判定 → 手工归一化（不依赖文件存在）
-    /// → 依次探测「原样 / 补全候选扩展名 / 目录 index」→ `canonicalize` 稳定化。
-    /// 裸说明符（无映射的非相对非绝对路径）当前不支持，与规范文档一致。
+    /// 步骤：判定是否命中 Import Maps →
+    /// - 命中：目标相对**基准目录**解析（相对/绝对/内建命名空间）；
+    /// - 未命中：说明符相对**引用者目录**解析（仅相对/绝对）。
+    ///
+    /// 随后统一做「手工归一化 → 扩展名补全 / 目录 index 探测 → `canonicalize`」。
     pub fn resolve(
         &self,
         specifier: &str,
         referrer: Option<&Path>,
     ) -> Result<PathBuf, ResolveError> {
-        let rewritten = self.rewrite(specifier);
-        let target = Path::new(&rewritten);
-        let is_relative = rewritten.starts_with("./") || rewritten.starts_with("../");
-
-        let joined = if is_relative {
-            let dir = referrer.and_then(|path| path.parent()).ok_or_else(|| {
-                ResolveError::new(format!("相对说明符 `{specifier}` 缺少引用者路径"))
-            })?;
-            dir.join(target)
-        } else if target.is_absolute() {
-            target.to_path_buf()
-        } else {
-            return Err(ResolveError::new(format!(
-                "无法解析裸说明符 `{specifier}`（当前仅支持相对路径与绝对路径）"
-            )));
+        let joined = match self.matched(specifier) {
+            Some(target) => self.mapped_to_path(&target)?,
+            None => self.plain_to_path(specifier, referrer)?,
         };
 
         let normalized = normalize(&joined)?;
@@ -129,6 +137,44 @@ impl ModuleResolver {
             .ok_or_else(|| ResolveError::new(format!("找不到 `{specifier}` 对应的文件")))?;
         std::fs::canonicalize(&found)
             .map_err(|_| ResolveError::new(format!("{} 规范化失败", found.display())))
+    }
+
+    /// Import Maps 目标地址的解析：相对基准目录，绝对路径原样，`@std/*` 暂不支持。
+    fn mapped_to_path(&self, target: &str) -> Result<PathBuf, ResolveError> {
+        let path = Path::new(target);
+        if path.is_absolute() {
+            return Ok(path.to_path_buf());
+        }
+        if target.starts_with('@') {
+            // 内建命名空间需要 stdlib 接入，本增量尚未提供，明确报错而非误指向磁盘。
+            return Err(ResolveError::new(format!(
+                "内建命名空间 `{target}` 尚未接入"
+            )));
+        }
+        Ok(self.base.join(path))
+    }
+
+    /// 未被映射的说明符解析：相对路径基于引用者目录，绝对路径原样，其余（裸名）不支持。
+    fn plain_to_path(
+        &self,
+        specifier: &str,
+        referrer: Option<&Path>,
+    ) -> Result<PathBuf, ResolveError> {
+        let path = Path::new(specifier);
+        let is_relative = specifier.starts_with("./") || specifier.starts_with("../");
+
+        if is_relative {
+            let dir = referrer.and_then(|p| p.parent()).ok_or_else(|| {
+                ResolveError::new(format!("相对说明符 `{specifier}` 缺少引用者路径"))
+            })?;
+            Ok(dir.join(path))
+        } else if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Err(ResolveError::new(format!(
+                "无法解析裸说明符 `{specifier}`（当前仅支持相对路径与绝对路径）"
+            )))
+        }
     }
 }
 
@@ -251,7 +297,30 @@ mod tests {
     }
 
     #[test]
-    fn resolve_applies_import_map_prefix() {
+    fn resolve_import_map_target_is_relative_to_base_not_referrer() {
+        // 基准目录（模拟配置文件所在）与引用者目录不同：映射目标 ./lib/ 必须相对 base 解析。
+        let base = temp_dir("base");
+        let referrer_dir = temp_dir("referrer");
+        std::fs::create_dir_all(base.join("lib")).unwrap();
+        std::fs::write(base.join("lib/vendor.ts"), "export const v = 1;").unwrap();
+
+        let mut resolver = ModuleResolver::default().with_base(base.clone());
+        resolver.insert_prefix("@app/", "./lib/");
+
+        let got = resolver
+            .resolve("@app/vendor", Some(&referrer_dir.join("main.ts")))
+            .unwrap();
+        assert!(
+            got.ends_with("lib/vendor.ts"),
+            "应命中 base 下的 vendor.ts，实得 {got:?}"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&referrer_dir).ok();
+    }
+
+    #[test]
+    fn resolve_maps_prefix_to_absolute_target() {
         let dir = temp_dir("map");
         std::fs::write(dir.join("vendor.ts"), "export const v = 1;").unwrap();
         let mut resolver = ModuleResolver::default();
@@ -261,5 +330,15 @@ mod tests {
             .unwrap();
         assert!(got.ends_with("vendor.ts"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_rejects_unsupported_std_namespace() {
+        let mut resolver = ModuleResolver::default();
+        resolver.insert_exact("@std/path", "@std/path");
+        let error = resolver
+            .resolve("@std/path", Some(Path::new("/tmp/main.ts")))
+            .expect_err("@std/* 尚未接入应报错");
+        assert!(error.to_string().contains("尚未接入"));
     }
 }
