@@ -12,10 +12,23 @@
 - 明确不提供 Node.js 与 CommonJS 兼容层：不解析 `node_modules`、不支持 `require`、不推断 `package.json` 入口、不支持裸包名。模块图因此完全静态可分析。
 - 技术栈固定为 Rust 1.97.1、Boa 0.22、OXC 0.156，均可在稳定版 Rust 上编译，无需 nightly。
 
+### 配置系统
+
+- 配置文件 `mio.json` 采用 `tsconfig.json` 骨架：顶层 `compilerOptions`、`include` / `exclude` / `files` 文件选择、`extends` 继承、JSONC 注释、`$schema` 提示。
+- 模块映射不采用 `compilerOptions.paths` / `baseUrl`：二者为编译期概念，不影响产物且依赖打包器配合。改用 Import Maps 规范的 `imports` / `scopes`，支持精确映射与最长前缀映射。映射目标为 `npm:` / `node:` / 裸包名时给出明确报错。
+- 字段分四档生效状态：生效、仅提示、预留、不采用。后两档在加载时打印告警，避免「写进配置却无人读取」。
+- `extends` 在 JSON 值层面深合并，对象逐字段合并、数组整体覆盖；支持字符串与数组形态、省略 `.json` 后缀、检出循环继承、链深度上限 16。
+- 配置发现从入口文件所在目录向上查找最近一份，找到即止；`--config` 可强制指定。
+- 优先级：内建默认 < 配置文件（含继承链） < `MIO_*` 环境变量 < 命令行选项。
+- 字符串支持 `$VAR` 与 `${VAR}` 展开；未定义变量原样保留，不替换为空串。
+- 未知字段不导致失败，但输出「未知字段 + 编辑距离最接近的合法字段」告警。
+- 通配匹配以路径段为单位实现，支持 `*`、`?`、`**`，配合记忆化避免指数级回溯。
+- `mio task` 可读取配置中声明的任务并按名列出。
+
 ### 工程骨架
 
 - 单 crate，edition 2024，模块按面向对象分层：`cli`、`config`、`transpiler`、`resolver`、`loader`、`engine`、`sourcemap`、`web`、`stdlib`。
 - 建立两个阶段共用的接缝：`engine::Engine` 执行引擎抽象，`resolver::Specifier` 说明符分类。
 - `engine::Engine` 内置 `boa_*` 依赖隔离约束，其他模块不得直接引用具体引擎。
 - 命令行支持 `--version` 与 `--help`，其余子命令返回未实现提示。
-- 单元测试 14 项通过，`clippy -D warnings` 与 `cargo fmt --check` 均为干净状态。
+- 测试 64 项通过（57 单元 + 7 端到端），`clippy -D warnings` 与 `cargo fmt --check` 均为干净状态。

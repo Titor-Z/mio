@@ -19,13 +19,16 @@ TodoID 规则：`TD` + UUID。TaolunID 规则：`TL` + `YYYYMMDDThhmmss`。
 - 确定配置系统形态：`mio.json`（JSONC），借鉴 `deno.json` 骨架，`imports` 与 `scopes` 采用 Import Maps 规范，字段分生效、仅提示、预留三档。
 - 建立仓库骨架：单 crate、edition 2024、Rust 1.97.1、Boa 0.22、OXC 0.156。
 - 建立模块分层与两个阶段接缝（`engine::Engine`、`resolver::Specifier`）。
+- 配置系统落地：`tsconfig.json` 骨架 + Import Maps 模块映射 + 四档生效状态标注 + JSON 值深合并继承 + 环境变量展开 + 未知字段告警。
 - 命令行支持 `--version` 与 `--help`。
-- 单元测试 14 项通过，clippy 与 fmt 干净。
+- 测试 64 项通过（57 单元 + 7 端到端），clippy 与 fmt 干净。
 
 **TodoLists[]**
 
 - TD48d4b0c036ac4ecd989f487505fde111（立项与仓库形态）
+- TD0b51717fc7d54c78ad0350af3fa5c08e（配置系统）
 
 **关联讨论**
 
 - TL20261030T041103
+- TL20261030T042730

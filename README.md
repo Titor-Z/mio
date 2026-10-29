@@ -60,8 +60,87 @@ src/
 
 ## 配置
 
-配置文件为 `mio.json`，支持 JSONC 注释，从入口文件所在目录向上查找最近一份。
-字段优先级：内建默认 < `mio.json` < `MIO_*` 环境变量 < 命令行选项。
+配置文件为 `mio.json`，支持 JSONC 注释，从入口文件所在目录向上查找最近一份，找到即止。
+字段优先级：内建默认 < `mio.json`（含 `extends` 链） < `MIO_*` 环境变量 < 命令行选项。
+
+骨架借鉴 `tsconfig.json`：顶层 `compilerOptions` 承载编译器开关，`include` / `exclude` / `files` 承载文件选择，`extends` 承载继承。
+与 `tsconfig.json` 的关键差异：模块映射不使用 `paths` / `baseUrl`。`paths` 是编译期概念，不影响产物且依赖打包器配合；mio 的模块解析发生在运行期，因此采用 Import Maps 规范的 `imports` / `scopes`。
+
+```jsonc
+{
+  "$schema": "https://mio.dev/schema/mio.json",
+  "extends": "./base/mio.json",
+
+  "compilerOptions": {
+    "target": "es2025",
+    "jsx": "preserve",
+    "useDefineForClassFields": true,
+  },
+
+  "include": ["src/**/*.ts"],
+  "exclude": [".mio", "dist"],
+
+  "imports": { "@app/": "./src/" },
+
+  "stdlib": { "web": "living", "disable": ["fetch"] },
+  "run": { "timeoutMs": 30000 },
+  "tasks": { "start": "run src/main.ts" },
+}
+```
+
+### 字段表
+
+字段分三档生效状态：**生效**（真实影响行为）、**仅提示**（记录并告警）、**预留**（解析但不参与运行）、**不采用**（命中时告警并建议替代方案）。
+
+| 字段 | 默认 | 状态 | 说明 |
+|---|---|---|---|
+| `extends` | 无 | 生效 | 单个路径或数组；JSON 值深合并，子配置覆盖父配置；检出循环继承 |
+| `compilerOptions.target` | `es2025` | 生效 | 传给转译层的目标版本 |
+| `compilerOptions.jsx` | `preserve` | 生效 | `preserve` / `react` / `react-jsx` |
+| `compilerOptions.jsxFactory` | `React.createElement` | 生效 | 仅在 `jsx` 为 `react` 时有意义 |
+| `compilerOptions.useDefineForClassFields` | `true` | 生效 | 类字段定义语义 |
+| `compilerOptions.module` | `esnext` | 仅提示 | mio 只有 ES Module 一种形态 |
+| `compilerOptions.moduleResolution` | `mio` | 仅提示 | 解析规则固定 |
+| `compilerOptions.lib` | `["es2025","web"]` | 仅提示 | 类型面，非运行时面 |
+| `compilerOptions.strict` | `false` | 仅提示 | 类型检查由外部 tsgo 负责 |
+| `compilerOptions.paths` | 无 | 不采用 | 改用 `imports`，命中时告警 |
+| `compilerOptions.baseUrl` | 无 | 不采用 | 改用 `imports`，命中时告警 |
+| `include` / `exclude` / `files` | 空 | 生效 | 通配模式，支持 `*`、`?`、`**`；`files` 命中优先，`exclude` 次之 |
+| `imports` | 空 | 生效 | Import Maps；`/` 结尾为前缀映射，否则精确映射 |
+| `scopes` | 空 | 预留 | 作用域映射，解析但不参与决策 |
+| `stdlib.web` | `living` | 仅提示 | WHATWG 无版本号，非 `living` 会告警 |
+| `stdlib.disable` | 空 | 生效 | 从全局注入中剔除的对象名 |
+| `module.root` | `.` | 生效 | 绝对说明符的基准目录 |
+| `module.extensions` | `.ts,.tsx,.mts,.js,.mjs,.json` | 生效 | 扩展名补全顺序 |
+| `check.typecheck` | `off` | 生效 | `off` 或 `tsgo` |
+| `check.tsgoPath` | 无 | 生效 | 支持 `$VAR` 与 `${VAR}` 展开 |
+| `run.timeoutMs` | `30000` | 生效 | 事件循环超时 |
+| `build.outDir` | `.mio/cache` | 生效 | 预转译产物目录（里程碑 3） |
+| `build.sourcemap` | `true` | 生效 | 是否落盘源码映射（里程碑 3） |
+| `log.level` | `info` | 生效 | `silent` / `error` / `warn` / `info` / `debug` |
+| `log.json` | `false` | 生效 | 结构化日志 |
+| `tasks` | 空 | 生效 | `mio task` 读取 |
+| `test.include` / `test.exclude` | 空 | 预留 | 测试文件选择，解析但不执行 |
+
+### 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `MIO_TYPECHECK` | 覆盖 `check.typecheck` |
+| `MIO_TIMEOUT_MS` | 覆盖 `run.timeoutMs` |
+| `MIO_LOG_LEVEL` | 覆盖 `log.level` |
+| `MIO_LOG_JSON` | 覆盖 `log.json`，取值 `1` / `true` / `yes` |
+| `MIO_STDLIB_WEB` | 覆盖 `stdlib.web` |
+
+未定义的 `$VAR` 引用原样保留，不替换为空串，避免路径静默指向意外位置。
+
+### 未知字段处理
+
+不启用严格模式：字段拼错时仍可运行，但会输出「未知字段 + 最接近的合法字段」告警：
+
+```
+mio: compilerOptions.targett：编译选项拼写可能有误，是否想写 target
+```
 
 ## 与 Node.js / Deno 的边界
 

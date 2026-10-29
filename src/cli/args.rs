@@ -33,6 +33,16 @@ pub enum Command {
     Help,
 }
 
+impl Command {
+    /// 取出命令携带的入口文件路径，供配置发现推导起始目录。
+    pub fn entry_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Run { path } | Self::Check { path } => Some(path.as_path()),
+            Self::Eval { .. } | Self::Repl | Self::Task { .. } | Self::Version | Self::Help => None,
+        }
+    }
+}
+
 /// 一次完整的命令行调用：命令本体 + 需要覆盖配置的选项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
