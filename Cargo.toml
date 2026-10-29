@@ -1,0 +1,45 @@
+[package]
+name = "mio"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.0"
+description = "TypeScript 一等公民的运行时：TS 源码直接作为输入，运行时内部完成类型擦除与执行"
+license = "MIT"
+repository = "https://github.com/titor-z/mio"
+readme = "README.md"
+keywords = ["typescript", "runtime", "javascript", "interpreter"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "mio"
+path = "src/main.rs"
+
+[lib]
+name = "mio"
+path = "src/lib.rs"
+
+[dependencies]
+# JavaScript 执行引擎（阶段 A 使用，隔离在 engine 模块内）
+boa_engine = "0.22"
+boa_gc = "0.22"
+boa_parser = "0.22"
+
+# TypeScript 转译管线（阶段 A 使用，隔离在 transpiler 模块内）
+oxc_allocator = "0.156"
+oxc_ast = "0.156"
+oxc_codegen = "0.156"
+oxc_parser = "0.156"
+oxc_semantic = "0.156"
+oxc_span = "0.156"
+oxc_transformer = "0.156"
+
+# 通用工具
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# fat LTO 在本项目依赖规模下编译时间超过十分钟，采用 thin LTO 折中
+lto = "thin"
+codegen-units = 1
+strip = true

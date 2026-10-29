@@ -1,0 +1,6 @@
+# 依赖的 OXC 与 Boa 版本均已在稳定版 Rust 上验证可编译
+# 1.97.1 满足 oxc 0.156 的 rust-version 要求（1.97.0），无需 nightly
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

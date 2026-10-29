@@ -1,0 +1,21 @@
+# 构建产物
+/target
+**/*.rs.bk
+*.pdb
+
+# 运行期缓存目录（mio build 的预转译产物）
+.mio/
+
+# AGENTS.md 仅存在本地，不对外发布：
+# 它包含内部进度看板、踩坑认知修正与协作约定
+AGENTS.md
+
+# 编辑器与系统文件
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 环境变量文件
+.env
+.env.local
