@@ -10,6 +10,7 @@
 pub mod cli;
 pub mod config;
 pub mod engine;
+pub mod lexer;
 pub mod loader;
 pub mod resolver;
 pub mod sourcemap;

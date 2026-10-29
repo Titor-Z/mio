@@ -8,8 +8,10 @@
 //!
 //! 依赖约束：`boa_*` 只允许出现在本模块内部，其余模块一律不得直接引用。
 
+mod boa_engine;
 mod error;
 
+pub use boa_engine::BoaEngine;
 pub use error::EngineError;
 
 use std::path::Path;

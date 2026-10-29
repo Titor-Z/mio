@@ -7,6 +7,8 @@
 use crate::cli::CliResult;
 use crate::cli::args::{Cli, Command};
 use crate::config::LoadedConfig;
+use crate::engine::{BoaEngine, Engine};
+use crate::transpiler::{TranspileConfig, Transpiler};
 
 /// 帮助文本。面向使用者描述可用子命令，不含内部实现细节。
 const HELP_TEXT: &str = "\
@@ -39,11 +41,36 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
             Ok(())
         }
         Command::Task { name } => run_task(config, name.as_deref()),
-        Command::Run { path } => Err(not_implemented(&format!("run {}", path.display()))),
-        Command::Eval { .. } => Err(not_implemented("eval")),
+        Command::Run { path } => run_file(path),
+        Command::Eval { source } => eval_source(source),
         Command::Repl => Err(not_implemented("repl")),
         Command::Check { path } => Err(not_implemented(&format!("check {}", path.display()))),
     }
+}
+
+/// 执行一个源码文件：读取 → 转译擦除类型 → 以 ES Module 语义求值。
+fn run_file(path: &std::path::Path) -> CliResult {
+    BoaEngine::new()
+        .eval_module_file(path)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// 执行一段内联源码：先按 TypeScript 转译擦除类型，再以脚本求值并回显非空结果。
+fn eval_source(source: &str) -> CliResult {
+    let output = Transpiler::transpile(
+        source,
+        std::path::Path::new("eval.ts"),
+        &TranspileConfig::default(),
+    )
+    .map_err(|diagnostics| diagnostics.join("\n"))?;
+    let value = BoaEngine::new()
+        .eval_script(&output.code)
+        .map_err(|error| error.to_string())?;
+    if !value.is_empty() {
+        println!("{value}");
+    }
+    Ok(())
 }
 
 /// 处理 `mio task`：无参时列出全部任务，有参时查找任务。

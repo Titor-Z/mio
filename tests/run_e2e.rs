@@ -1,0 +1,105 @@
+//! 端到端测试：`mio run` 执行 TypeScript 文件。
+//!
+//! 覆盖里程碑 1 的最小垂直切片：类型/接口擦除、enum 求值、console 可观测输出、
+//! 运行期异常收敛为退出码 1。
+//!
+//! 与 `config_e2e.rs` 不同，本测试不依赖任何配置，仅用临时目录隔离用例。
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+fn mio_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_mio"))
+}
+
+fn run(args: &[&str]) -> Output {
+    Command::new(mio_binary())
+        .args(args)
+        .output()
+        .expect("mio 二进制应能被调用")
+}
+
+fn unique_dir(tag: &str) -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    dir.push(format!("mio-run-{tag}-{nanos}"));
+    std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+    dir
+}
+
+#[test]
+fn run_erases_types_and_prints() {
+    let dir = unique_dir("basic");
+    let file = dir.join("hello.ts");
+    std::fs::write(
+        &file,
+        "interface User { name: string }\n\
+         type Id = number;\n\
+         const u: User = { name: 'ada' };\n\
+         console.log('id', 1 + 2, u.name);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "run 应成功退出：{output:?}");
+    assert_eq!(stdout.trim(), "id 3 ada");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_evaluates_enum_members() {
+    let dir = unique_dir("enum");
+    let file = dir.join("en.ts");
+    std::fs::write(
+        &file,
+        "enum Dir { Up = 1, Down = 2 }\n\
+         console.log(Dir.Up + Dir.Down);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "enum 求值应成功：{output:?}");
+    assert_eq!(stdout.trim(), "3");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_reports_runtime_error_with_exit_one() {
+    let dir = unique_dir("throw");
+    let file = dir.join("boom.ts");
+    std::fs::write(&file, "throw new Error('boom');\n").unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "运行期异常应以 1 退出");
+    assert!(stderr.contains("boom"), "stderr 应包含异常信息：{stderr}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_reports_syntax_error_with_exit_one() {
+    let dir = unique_dir("syntax");
+    let file = dir.join("bad.ts");
+    std::fs::write(&file, "const x: = ;\n").unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "语法/转译错误应以 1 退出");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn eval_prints_completion_value() {
+    let output = run(&["eval", "const f=(n:number):number=>n*2; f(21)"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "eval 应成功：{output:?}");
+    assert_eq!(stdout.trim(), "42");
+}
