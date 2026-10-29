@@ -6,14 +6,20 @@
 //!
 //! 路径解析委托给 [`crate::resolver::ModuleResolver`]：Import Maps 重写、相对/绝对判定、
 //! 扩展名补全与目录 `index.*` 命中都在其中。本文件只承担「拿到路径→读→转译→解析→缓存」。
+//!
+//! 另一类是 `@std/*` 内建模块：不读文件，而是把 [`crate::stdlib`] 里的纯 Rust 实现（引擎无关）
+//! 装配为 Boa 合成模块（synthetic module）。这是引擎侧的包装职责，`boa_*` 因此仍只在本模块出现。
 
 use std::cell::RefCell;
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
-use boa_engine::{Context, JsNativeError, JsResult, Module, Source};
+use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer, SyntheticModuleInitializer};
+use boa_engine::object::FunctionObjectBuilder;
+use boa_engine::{
+    Context, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction, Source, js_string,
+};
 
 use crate::resolver::ModuleResolver;
 use crate::transpiler::{TranspileConfig, Transpiler};
@@ -51,46 +57,137 @@ impl ModuleLoader for TsModuleLoader {
         // 全部工作同步完成，用 `async { result }` 满足 trait 的 Future 契约。
         let result: JsResult<Module> = (|| {
             let specifier = request.specifier().to_std_string_escaped();
-            let path = self
-                .resolver
-                .resolve(&specifier, referrer.path())
-                .map_err(|error| {
-                    JsNativeError::typ()
-                        .with_message(format!("模块解析失败 `{specifier}`：{error}"))
-                })?;
 
-            if let Some(existing) = self.cache.borrow().get(&path) {
-                return Ok(existing.clone());
+            // 先过 Import Maps：若重写后仍是 `@std/` 前缀，说明用户未把该内建模块
+            // 改指向本地路径，按合成模块装配；否则继续走文件解析。
+            let rewritten = self.resolver.rewrite(&specifier);
+            if let Some(builtin) = rewritten.strip_prefix("@std/") {
+                return self.load_builtin(builtin, context);
             }
 
-            let raw = std::fs::read_to_string(&path).map_err(|error| {
-                JsNativeError::typ().with_message(format!("无法读取 {}：{error}", path.display()))
-            })?;
-
-            let output = Transpiler::transpile(&raw, &path, &TranspileConfig::default()).map_err(
-                |diagnostics| {
-                    JsNativeError::syntax().with_message(format!(
-                        "转译 {} 失败：{}",
-                        path.display(),
-                        diagnostics.join("\n")
-                    ))
-                },
-            )?;
-
-            let module = Module::parse(
-                Source::from_bytes(&output.code).with_path(&path),
-                None,
-                &mut context.borrow_mut(),
-            )
-            .map_err(|error| {
-                JsNativeError::syntax()
-                    .with_message(format!("解析 {} 失败：{error}", path.display()))
-            })?;
-
-            self.cache.borrow_mut().insert(path, module.clone());
-            Ok(module)
+            self.load_file(&specifier, referrer.path(), context)
         })();
 
         async { result }
     }
+}
+
+impl TsModuleLoader {
+    /// 加载一个文件模块：解析→读→转译→解析为模块→按绝对路径缓存。
+    fn load_file(
+        &self,
+        specifier: &str,
+        referrer: Option<&std::path::Path>,
+        context: &RefCell<&mut Context>,
+    ) -> JsResult<Module> {
+        let path = self
+            .resolver
+            .resolve(specifier, referrer)
+            .map_err(|error| {
+                JsNativeError::typ().with_message(format!("模块解析失败 `{specifier}`：{error}"))
+            })?;
+
+        if let Some(existing) = self.cache.borrow().get(&path) {
+            return Ok(existing.clone());
+        }
+
+        let raw = std::fs::read_to_string(&path).map_err(|error| {
+            JsNativeError::typ().with_message(format!("无法读取 {}：{error}", path.display()))
+        })?;
+
+        let output = Transpiler::transpile(&raw, &path, &TranspileConfig::default()).map_err(
+            |diagnostics| {
+                JsNativeError::syntax().with_message(format!(
+                    "转译 {} 失败：{}",
+                    path.display(),
+                    diagnostics.join("\n")
+                ))
+            },
+        )?;
+
+        let module = Module::parse(
+            Source::from_bytes(&output.code).with_path(&path),
+            None,
+            &mut context.borrow_mut(),
+        )
+        .map_err(|error| {
+            JsNativeError::syntax().with_message(format!("解析 {} 失败：{error}", path.display()))
+        })?;
+
+        self.cache.borrow_mut().insert(path, module.clone());
+        Ok(module)
+    }
+
+    /// 加载一个 `@std/<name>` 内建模块：以 `@std/<name>` 为缓存键去重，未命中时装配合成模块。
+    fn load_builtin(&self, name: &str, context: &RefCell<&mut Context>) -> JsResult<Module> {
+        let key = PathBuf::from(format!("@std/{name}"));
+        if let Some(existing) = self.cache.borrow().get(&key) {
+            return Ok(existing.clone());
+        }
+
+        let module = build_builtin(name, &mut context.borrow_mut())?;
+        self.cache.borrow_mut().insert(key, module.clone());
+        Ok(module)
+    }
+}
+
+/// 把 `@std/<name>` 的描述表装配为 Boa 合成模块。
+///
+/// 初始化闭包只捕获 `&'static` 切片（均为 `Copy`），故可用 `from_copy_closure`；
+/// 真正的 `NativeFunction` 在求值时按 `crate::stdlib` 的纯函数现场构造。
+fn build_builtin(name: &str, context: &mut Context) -> JsResult<Module> {
+    let builtin = crate::stdlib::lookup(name).ok_or_else(|| {
+        JsNativeError::typ().with_message(format!("未知的内建模块 `@std/{name}`"))
+    })?;
+
+    let functions = builtin.functions;
+    let constants = builtin.string_constants;
+
+    let export_names: Vec<JsString> = functions
+        .iter()
+        .map(|function| js_string!(function.name))
+        .chain(constants.iter().map(|(key, _)| js_string!(*key)))
+        .collect();
+
+    let initializer = SyntheticModuleInitializer::from_copy_closure(move |synthetic, ctx| {
+        for function in functions {
+            let call = function.call;
+            let export_name = function.name;
+            let native = NativeFunction::from_copy_closure(move |_this, args, _ctx| {
+                let mut owned: Vec<String> = Vec::with_capacity(args.len());
+                for arg in args {
+                    let Some(value) = arg.as_string() else {
+                        return Err(JsNativeError::typ()
+                            .with_message(format!("内建函数 `{export_name}` 只接受字符串参数"))
+                            .into());
+                    };
+                    owned.push(value.to_std_string_escaped());
+                }
+                let references: Vec<&str> = owned.iter().map(String::as_str).collect();
+                match call(&references) {
+                    Ok(result) => Ok(JsValue::from(js_string!(result))),
+                    Err(message) => Err(JsNativeError::typ().with_message(message).into()),
+                }
+            });
+
+            let value = FunctionObjectBuilder::new(ctx.realm(), native)
+                .name(js_string!(export_name))
+                .build();
+            synthetic.set_export(&js_string!(export_name), value.into())?;
+        }
+
+        for (key, value) in constants {
+            synthetic.set_export(&js_string!(*key), JsValue::from(js_string!(*value)))?;
+        }
+
+        Ok(())
+    });
+
+    Ok(Module::synthetic(
+        &export_names,
+        initializer,
+        Some(PathBuf::from(format!("@std/{name}"))),
+        None,
+        context,
+    ))
 }

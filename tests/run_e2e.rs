@@ -189,3 +189,67 @@ fn run_resolves_import_map_alias_against_config_root() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn run_resolves_std_path_builtin() {
+    let dir = unique_dir("stdpath");
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { join, extname } from '@std/path';\n\
+         console.log(join('a', 'b'), extname('x.tar.gz'));\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("main.ts").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "@std/path 应可用：{output:?}");
+    assert_eq!(stdout.trim(), "a/b .gz");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn import_map_can_override_std_namespace() {
+    // 用户把 @std/path 重映射到本地文件时，应优先采用本地实现而非内建。应
+    let dir = unique_dir("override");
+    std::fs::write(
+        dir.join("mio.json"),
+        "{ \"imports\": { \"@std/path\": \"./local/path.ts\" } }",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("local")).unwrap();
+    std::fs::write(
+        dir.join("local/path.ts"),
+        "export const join = (...p: string[]): string => `over:${p.join('!')}`;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { join } from '@std/path';\nconsole.log(join('a', 'b'));\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("main.ts").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "覆盖应成功：{output:?}");
+    assert_eq!(stdout.trim(), "over:a!b");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unknown_std_module_reports_error() {
+    let dir = unique_dir("unknown-std");
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { x } from '@std/doesnotexist';\nconsole.log(x);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("main.ts").to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "未知内建模块应以 1 退出");
+    assert!(stderr.contains("doesnotexist"), "应指名未知模块：{stderr}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
