@@ -4,22 +4,27 @@
 //! 上层只通过 [`Engine`] 抽象与本文件交互。替换阶段 B 的自研虚拟机时，只需新增
 //! 一个实现 [`Engine`] 的类型，上游命令行与加载逻辑不受影响。
 //!
-//! 当前实现覆盖里程碑 1 的最小垂直切片：读取单文件 → 转译擦除类型 → 以 ES Module
-//! 语义求值 → 驱动微任务。多文件模块图、`@std/*` 与 `fetch` 在此之上分层补齐。
+//! 当前实现覆盖里程碑 1 的垂直切片：读取单文件→转译擦除类型→以 ES Module 语义求值
+//! →驱动微任务；入口模块预填入 [`TsModuleLoader`] 缓存，相对 `import` 经解析后递归转译加载。
+//! `@std/*` 与 `fetch` 在此之上分层补齐。
 
 use std::path::Path;
+use std::rc::Rc;
 
+use boa_engine::Module;
 use boa_engine::builtins::promise::PromiseState;
 use boa_engine::object::FunctionObjectBuilder;
 use boa_engine::property::{Attribute, PropertyDescriptor};
 use boa_engine::{Context, JsError, JsObject, JsValue, NativeFunction, Source, js_string};
 
+use super::loader::TsModuleLoader;
 use super::{Engine, EngineError};
 use crate::transpiler::{TranspileConfig, Transpiler};
 
-/// Boa 引擎包装。持有唯一的活动 [`Context`]。
+/// Boa 引擎包装。持有唯一的活动 [`Context`] 与共享的模块加载器。
 pub struct BoaEngine {
     context: Context,
+    loader: Rc<TsModuleLoader>,
 }
 
 impl Default for BoaEngine {
@@ -29,23 +34,43 @@ impl Default for BoaEngine {
 }
 
 impl BoaEngine {
-    /// 构造引擎并注入最小可观测全局（`console.log`）。
+    /// 构造引擎：装配带转译加载器的 `Context`，并注入最小可观测全局（`console.log`）。
     pub fn new() -> Self {
-        let mut context = Context::default();
+        let loader = Rc::new(TsModuleLoader::default());
+        let mut context = Context::builder()
+            .module_loader(loader.clone())
+            .build()
+            .expect("构建 Boa Context 失败");
         install_console(&mut context);
-        Self { context }
+        Self { context, loader }
     }
 }
 
 impl Engine for BoaEngine {
     fn eval_module_file(&mut self, path: &Path) -> Result<String, EngineError> {
-        let raw = std::fs::read_to_string(path)
+        // 规范成绝对路径：既保证入口文件可读，又让入口的相对 import 与后续模块的
+        // 解析落在同一基准目录上，缓存键因此稳定。
+        let canonical = std::fs::canonicalize(path)
             .map_err(|error| EngineError::new("读取", format!("{}：{error}", path.display())))?;
 
-        let output = Transpiler::transpile(&raw, path, &TranspileConfig::default())
+        let raw = std::fs::read_to_string(&canonical).map_err(|error| {
+            EngineError::new("读取", format!("{}：{error}", canonical.display()))
+        })?;
+
+        let output = Transpiler::transpile(&raw, &canonical, &TranspileConfig::default())
             .map_err(|diagnostics| EngineError::new("转译", diagnostics.join("\n")))?;
 
-        self.eval_module_source(&output.code, Some(path))
+        let module = Module::parse(
+            Source::from_bytes(&output.code).with_path(&canonical),
+            None,
+            &mut self.context,
+        )
+        .map_err(|error| EngineError::new("解析", error.to_string()))?;
+
+        // 预注册入口：被间接 import 时复用同一实例，避免二次转译并支持环依赖。
+        self.loader.register(canonical.clone(), module.clone());
+
+        self.evaluate(module)
     }
 
     fn eval_module_source(
@@ -54,27 +79,16 @@ impl Engine for BoaEngine {
         hint: Option<&Path>,
     ) -> Result<String, EngineError> {
         let module = match hint {
-            Some(path) => boa_engine::Module::parse(
+            Some(path) => Module::parse(
                 Source::from_bytes(source).with_path(path),
                 None,
                 &mut self.context,
             ),
-            None => boa_engine::Module::parse(Source::from_bytes(source), None, &mut self.context),
+            None => Module::parse(Source::from_bytes(source), None, &mut self.context),
         }
         .map_err(|error| EngineError::new("解析", error.to_string()))?;
 
-        // load_link_evaluate 走 加载→链接→求值 全生命周期，错误以 rejected Promise 形式返回；
-        // 先驱动微任务，再检查最终状态以向上暴露运行期异常。
-        let promise = module.load_link_evaluate(&mut self.context);
-        self.run_jobs()?;
-        if let PromiseState::Rejected(reason) = promise.state() {
-            return Err(EngineError::new(
-                "运行期",
-                JsError::from_opaque(reason).to_string(),
-            ));
-        }
-
-        Ok(String::new())
+        self.evaluate(module)
     }
 
     fn eval_script(&mut self, source: &str) -> Result<String, EngineError> {
@@ -89,6 +103,21 @@ impl Engine for BoaEngine {
         self.context
             .run_jobs()
             .map_err(|error| EngineError::new("微任务", error.to_string()))
+    }
+}
+
+impl BoaEngine {
+    /// 驱动模块完整生命周期（加载→链接→求值），并回收拒绝状态为引擎错误。
+    fn evaluate(&mut self, module: Module) -> Result<String, EngineError> {
+        let promise = module.load_link_evaluate(&mut self.context);
+        self.run_jobs()?;
+        if let PromiseState::Rejected(reason) = promise.state() {
+            return Err(EngineError::new(
+                "运行期",
+                JsError::from_opaque(reason).to_string(),
+            ));
+        }
+        Ok(String::new())
     }
 }
 

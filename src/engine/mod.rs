@@ -10,6 +10,7 @@
 
 mod boa_engine;
 mod error;
+mod loader;
 
 pub use boa_engine::BoaEngine;
 pub use error::EngineError;
