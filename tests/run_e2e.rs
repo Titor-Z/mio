@@ -12,6 +12,79 @@ fn mio_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mio"))
 }
 
+/// 启动一个本地 mock HTTP 服务器（仅监听回环地址，不依赖公网）。
+///
+/// 路由：`/hello` 200 文本+重复自定义头；`/json` 200 JSON；`/missing` 404；
+/// 其余 200 回显路径；`/slow` 接受连接但不回应，用于触发宿主超时。
+/// 每个连接响应后关闭（`connection: close`）。服务器随测试进程结束自然回收。
+fn spawn_mock_server() -> u16 {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock 服务器应能绑定 ephemeral 端口");
+    let port = listener
+        .local_addr()
+        .expect("mock 服务器应有本地地址")
+        .port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().expect("克隆连接应成功"));
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            // 耗尽请求头，避免过早断开影响客户端发送。
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/")
+                .to_string();
+            if path == "/slow" {
+                // 不回应：挂住连接，直到宿主事件循环预算耗尽。
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    drop(stream);
+                });
+                continue;
+            }
+            let (status, body, extra): (&str, String, String) = match path.as_str() {
+                "/hello" => (
+                    "200 OK",
+                    String::from("hello mio"),
+                    String::from("x-mio: ok\r\nx-mio: again\r\n"),
+                ),
+                "/json" => (
+                    "200 OK",
+                    String::from(r#"{"answer":42}"#),
+                    String::from("content-type: application/json\r\n"),
+                ),
+                "/missing" => ("404 Not Found", String::from("nope"), String::new()),
+                other => ("200 OK", format!("path={other}"), String::new()),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n{extra}\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    port
+}
+
 fn run(args: &[&str]) -> Output {
     Command::new(mio_binary())
         .args(args)
@@ -107,6 +180,28 @@ fn run_with_typecheck_flag_aborts_on_type_error() {
         !combined.contains("SHOULD_NOT_PRINT"),
         "不应推进到运行时：{combined}"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_supports_top_level_await() {
+    let dir = unique_dir("tla");
+    let file = dir.join("tla.ts");
+    // ES2022 顶层 await：模块求值应挂起至 Promise settle 后再继续。
+    std::fs::write(
+        &file,
+        "interface Box { v: number }\n\
+         const b: Box = { v: 41 };\n\
+         const got: number = await Promise.resolve(b.v + 1);\n\
+         console.log('tla', got);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "顶层 await 应能执行：{output:?}");
+    assert_eq!(stdout.trim(), "tla 42");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -392,6 +487,153 @@ fn unknown_std_module_reports_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "未知内建模块应以 1 退出");
     assert!(stderr.contains("doesnotexist"), "应指名未知模块：{stderr}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_resolves_response_status_headers_and_text() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-basic");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const r = await fetch('http://127.0.0.1:{port}/hello');\n\
+             console.log(r.status, r.ok, r.headers.get('x-mio'), r.headers.has('nope'), await r.text());\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "fetch 用例应成功退出：{output:?}");
+    assert_eq!(stdout.trim(), "200 true ok, again false hello mio");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_json_body_parses_via_await() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-json");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "interface Payload {{ answer: number }}\n\
+             const r = await fetch('http://127.0.0.1:{port}/json');\n\
+             const data: Payload = await r.json();\n\
+             console.log('answer', data.answer, 'type', r.headers.get('content-type'));\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "json 用例应成功退出：{output:?}");
+    assert_eq!(stdout.trim(), "answer 42 type application/json");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_error_status_is_not_rejection() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-404");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const r = await fetch('http://127.0.0.1:{port}/missing');\n\
+             console.log(r.status, r.ok, await r.text());\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "404 不是拒绝：{output:?}");
+    assert_eq!(stdout.trim(), "404 false nope");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_rejects_invalid_url_with_type_error() {
+    let dir = unique_dir("fetch-bad-url");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "try {\n\
+         \x20   await fetch('not-a-url');\n\
+         \x20   console.log('NOT_REJECTED');\n\
+         } catch (e) {\n\
+         \x20   console.log('rejected', e instanceof TypeError);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "捕获后应正常退出：{output:?}");
+    assert_eq!(stdout.trim(), "rejected true");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_timeout_rejects_with_budget_from_config() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-timeout");
+    std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 300 } }").unwrap();
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "try {{\n\
+             \x20   await fetch('http://127.0.0.1:{port}/slow');\n\
+             \x20   console.log('NOT_REJECTED');\n\
+             }} catch (e) {{\n\
+             \x20   console.log('timeout?', String(e).includes('timed out'));\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&[
+        "-c",
+        dir.join("mio.json").to_str().unwrap(),
+        "run",
+        file.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "超时应被捕获而非挂死：{output:?}");
+    assert_eq!(stdout.trim(), "timeout? true");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_accepts_top_level_await_and_fetch_types() {
+    let dir = unique_dir("check-fetch");
+    let file = dir.join("app.ts");
+    // 顶层 await + fetch：tsrs 自带 DOM lib，且 moduleDetection 已按运行时语义对齐，应零诊断。
+    std::fs::write(
+        &file,
+        "interface Payload { answer: number }\n\
+         const r = await fetch('http://example.com');\n\
+         const data: Payload = await r.json();\n\
+         console.log(data.answer);\n",
+    )
+    .unwrap();
+
+    let output = run(&["check", file.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "合法 fetch/TLA 代码应通过检查：{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

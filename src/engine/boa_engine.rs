@@ -5,11 +5,13 @@
 //! 一个实现 [`Engine`] 的类型，上游命令行与加载逻辑不受影响。
 //!
 //! 当前实现覆盖里程碑 1 的垂直切片：读取单文件→转译擦除类型→以 ES Module 语义求值
-//! →驱动微任务；入口模块预填入 [`TsModuleLoader`] 缓存，相对 `import` 经解析后递归转译加载。
-//! `@std/*` 与 `fetch` 在此之上分层补齐。
+//! →驱动微任务与宿主事件循环（在途 fetch 的等待与 settle）；入口模块预填入 [`TsModuleLoader`]
+//! 缓存，相对 `import` 经解析后递归转译加载；`@std/*` 内建模块与 `fetch`/`console` 全局已接入。
 
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use boa_engine::Module;
 use boa_engine::builtins::promise::PromiseState;
@@ -17,15 +19,18 @@ use boa_engine::object::FunctionObjectBuilder;
 use boa_engine::property::{Attribute, PropertyDescriptor};
 use boa_engine::{Context, JsError, JsObject, JsValue, NativeFunction, Source, js_string};
 
+use super::fetch::{self as engine_fetch, FetchResult};
 use super::loader::TsModuleLoader;
 use super::{Engine, EngineError};
 use crate::resolver::ModuleResolver;
 use crate::transpiler::{TranspileConfig, Transpiler};
 
-/// Boa 引擎包装。持有唯一的活动 [`Context`] 与共享的模块加载器。
+/// Boa 引擎包装。持有唯一的活动 [`Context`]、共享的模块加载器与 fetch 完成通道。
 pub struct BoaEngine {
     context: Context,
     loader: Rc<TsModuleLoader>,
+    fetch_rx: Receiver<FetchResult>,
+    timeout_ms: u64,
 }
 
 impl Default for BoaEngine {
@@ -51,7 +56,22 @@ impl BoaEngine {
             .build()
             .expect("构建 Boa Context 失败");
         install_console(&mut context);
-        Self { context, loader }
+        let fetch_rx = engine_fetch::install(&mut context);
+        Self {
+            context,
+            loader,
+            fetch_rx,
+            timeout_ms: 30_000,
+        }
+    }
+
+    /// 设置宿主事件循环的总预算（毫秒），用于 fetch 在途请求的超时上限。
+    ///
+    /// 由命令行从 `run.timeoutMs` 配置传入；默认 30000。
+    #[must_use]
+    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
     }
 }
 
@@ -116,10 +136,12 @@ impl Engine for BoaEngine {
 }
 
 impl BoaEngine {
-    /// 驱动模块完整生命周期（加载→链接→求值），并回收拒绝状态为引擎错误。
+    /// 驱动模块完整生命周期（加载→链接→求值），再跑宿主事件循环直到就绪，
+    /// 最后回收拒绝状态为引擎错误。
     fn evaluate(&mut self, module: Module) -> Result<String, EngineError> {
         let promise = module.load_link_evaluate(&mut self.context);
         self.run_jobs()?;
+        self.drive_event_loop()?;
         if let PromiseState::Rejected(reason) = promise.state() {
             return Err(EngineError::new(
                 "运行期",
@@ -127,6 +149,33 @@ impl BoaEngine {
             ));
         }
         Ok(String::new())
+    }
+
+    /// 宿主事件循环：只要还有在途 fetch，就阻塞等待完成、settle、再排空微任务。
+    ///
+    /// 预算耗尽（`run.timeoutMs`）时，所有在途请求以 `TypeError` 拒绝，
+    /// 避免永久挂起；之后的 `run_jobs` 让拒绝进入用户 catch 或成为未处理拒绝。
+    fn drive_event_loop(&mut self) -> Result<(), EngineError> {
+        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
+        while engine_fetch::has_pending() {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            match self.fetch_rx.recv_timeout(budget) {
+                Ok(first) => {
+                    let mut batch = vec![first];
+                    while let Ok(more) = self.fetch_rx.try_recv() {
+                        batch.push(more);
+                    }
+                    engine_fetch::settle(&batch, &mut self.context);
+                    self.run_jobs()?;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    engine_fetch::reject_all_pending("fetch timed out", &mut self.context);
+                    self.run_jobs()?;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
     }
 }
 

@@ -50,7 +50,9 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
 
 /// 执行一次纯类型检查：复用 fork 进来的 tsrs 编译器驱动 `tsrs_execute::command_line`。
 ///
-/// `--noEmit` 与文件路径由参数拼接；`compilerOptions.strict == true` 时附加 `--strict`。
+/// 参数对齐 mio 的运行语义：每个文件都按 ES Module 检查（`moduleDetection force` +
+/// `target/module esnext`），顶层 await 因此合法；`compilerOptions.strict` 附加 `--strict`。
+/// tsrs 自带 DOM lib，`fetch`/`Response`/`Headers`/`console` 无需额外声明文件。
 /// 诊断由编译器自身按 `file:line:col error TSxxxx` 格式写到 stdout/stderr；
 /// 本函数只负责选择参数、在足够大的栈线程里跑（类型检查递归很深）、把退出码翻译成结果。
 fn check_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
@@ -62,7 +64,16 @@ fn check_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
         .stack_size(512 << 20)
         .spawn(move || {
             let host: &'static dyn tsc::System = Box::leak(Box::new(sys::new_system()));
-            let mut args = vec![String::from("--noEmit")];
+            let mut args = vec![
+                String::from("--noEmit"),
+                // 与 mio 运行时的模块语义对齐：每个文件都是 ES Module（顶层 await 因此合法）。
+                String::from("--moduleDetection"),
+                String::from("force"),
+                String::from("--target"),
+                String::from("esnext"),
+                String::from("--module"),
+                String::from("esnext"),
+            ];
             if strict {
                 args.push(String::from("--strict"));
             }
@@ -96,6 +107,7 @@ fn run_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
         .build_resolver()?
         .with_base(config.root_dir.clone());
     BoaEngine::with_resolver(resolver)
+        .with_timeout(config.config.run.timeout_ms)
         .eval_module_file(path)
         .map(|_| ())
         .map_err(|error| error.to_string())

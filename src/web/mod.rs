@@ -10,3 +10,5 @@
 //! 4. 取消用 `AbortSignal`
 //! 5. 字符串按 USVString 处理
 //! 6. 错误用 `TypeError` / `RangeError` 等标准类型
+
+pub mod fetch;

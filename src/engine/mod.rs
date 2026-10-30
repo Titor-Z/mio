@@ -10,6 +10,7 @@
 
 mod boa_engine;
 mod error;
+mod fetch;
 mod loader;
 
 pub use boa_engine::BoaEngine;
