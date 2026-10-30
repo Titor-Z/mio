@@ -106,7 +106,12 @@ fn run_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
         .config
         .build_resolver()?
         .with_base(config.root_dir.clone());
-    BoaEngine::with_resolver(resolver)
+    let compiler = &config.config.compiler_options;
+    let transpile = TranspileConfig {
+        target: Some(compiler.target.clone()),
+        sourcemap: compiler.source_map,
+    };
+    BoaEngine::with_transpile(resolver, transpile)
         .with_timeout(config.config.run.timeout_ms)
         .eval_module_file(path)
         .map(|_| ())

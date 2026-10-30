@@ -29,6 +29,7 @@ use crate::transpiler::{TranspileConfig, Transpiler};
 pub struct BoaEngine {
     context: Context,
     loader: Rc<TsModuleLoader>,
+    transpile: TranspileConfig,
     fetch_rx: Receiver<FetchResult>,
     timeout_ms: u64,
 }
@@ -50,7 +51,12 @@ impl BoaEngine {
     /// 命令行将 `mio.json` 的 `imports` 映射与配置目录装配成 [`ModuleResolver`] 传入，
     /// 使别名导入在运行时生效。
     pub fn with_resolver(resolver: ModuleResolver) -> Self {
-        let loader = Rc::new(TsModuleLoader::new(resolver));
+        Self::with_transpile(resolver, TranspileConfig::default())
+    }
+
+    /// 同上，并指定转译参数（`target` 降级与 `sourcemap` 开关由配置层传入）。
+    pub fn with_transpile(resolver: ModuleResolver, transpile: TranspileConfig) -> Self {
+        let loader = Rc::new(TsModuleLoader::new(resolver, transpile.clone()));
         let mut context = Context::builder()
             .module_loader(loader.clone())
             .build()
@@ -60,6 +66,7 @@ impl BoaEngine {
         Self {
             context,
             loader,
+            transpile,
             fetch_rx,
             timeout_ms: 30_000,
         }
@@ -86,15 +93,20 @@ impl Engine for BoaEngine {
             EngineError::new("读取", format!("{}：{error}", canonical.display()))
         })?;
 
-        let output = Transpiler::transpile(&raw, &canonical, &TranspileConfig::default())
+        let output = Transpiler::transpile(&raw, &canonical, &self.transpile)
             .map_err(|diagnostics| EngineError::new("转译", diagnostics.join("\n")))?;
+        if let Some(mapping) = output.sourcemap {
+            self.loader.register_source_map(&canonical, mapping);
+        }
 
         let module = Module::parse(
             Source::from_bytes(&output.code).with_path(&canonical),
             None,
             &mut self.context,
         )
-        .map_err(|error| EngineError::new("解析", error.to_string()))?;
+        .map_err(|error| {
+            EngineError::new("解析", self.loader.remap_error_text(&error.to_string()))
+        })?;
 
         // 预注册入口：被间接 import 时复用同一实例，避免二次转译并支持环依赖。
         self.loader.register(canonical.clone(), module.clone());
@@ -115,7 +127,9 @@ impl Engine for BoaEngine {
             ),
             None => Module::parse(Source::from_bytes(source), None, &mut self.context),
         }
-        .map_err(|error| EngineError::new("解析", error.to_string()))?;
+        .map_err(|error| {
+            EngineError::new("解析", self.loader.remap_error_text(&error.to_string()))
+        })?;
 
         self.evaluate(module)
     }
@@ -129,9 +143,9 @@ impl Engine for BoaEngine {
     }
 
     fn run_jobs(&mut self) -> Result<(), EngineError> {
-        self.context
-            .run_jobs()
-            .map_err(|error| EngineError::new("微任务", error.to_string()))
+        self.context.run_jobs().map_err(|error| {
+            EngineError::new("微任务", self.loader.remap_error_text(&error.to_string()))
+        })
     }
 }
 
@@ -143,9 +157,10 @@ impl BoaEngine {
         self.run_jobs()?;
         self.drive_event_loop()?;
         if let PromiseState::Rejected(reason) = promise.state() {
+            let message = JsError::from_opaque(reason).to_string();
             return Err(EngineError::new(
                 "运行期",
-                JsError::from_opaque(reason).to_string(),
+                self.loader.remap_error_text(&message),
             ));
         }
         Ok(String::new())

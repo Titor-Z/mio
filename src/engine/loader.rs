@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer, SyntheticModuleInitializer};
@@ -22,6 +22,7 @@ use boa_engine::{
 };
 
 use crate::resolver::ModuleResolver;
+use crate::sourcemap::{SourceMapEntry, SourceMapRegistry, remap_stack};
 use crate::transpiler::{TranspileConfig, Transpiler};
 
 /// 携带转译步骤与路径缓存的模块加载器。
@@ -29,14 +30,37 @@ use crate::transpiler::{TranspileConfig, Transpiler};
 pub struct TsModuleLoader {
     cache: RefCell<rustc_hash::FxHashMap<PathBuf, Module>>,
     resolver: ModuleResolver,
+    transpile: TranspileConfig,
+    registry: RefCell<SourceMapRegistry>,
 }
 
 impl TsModuleLoader {
-    /// 用指定解析器构造加载器（解析器携带 Import Maps 与基准目录）。
-    pub fn new(resolver: ModuleResolver) -> Self {
+    /// 用指定解析器与转译参数构造加载器（解析器携带 Import Maps 与基准目录）。
+    pub fn new(resolver: ModuleResolver, transpile: TranspileConfig) -> Self {
         Self {
             cache: RefCell::new(rustc_hash::FxHashMap::default()),
             resolver,
+            transpile,
+            registry: RefCell::new(SourceMapRegistry::default()),
+        }
+    }
+
+    /// 登记一份产物对应的源码映射（入口文件由引擎侧转译，映射在此汇入同一注册表）。
+    pub fn register_source_map(&self, path: &Path, mapping: String) {
+        self.registry.borrow_mut().register(
+            path,
+            SourceMapEntry {
+                source_path: path.to_path_buf(),
+                mapping,
+            },
+        );
+    }
+
+    /// 把错误文本中命中已登记映射的栈帧坐标改写回 TypeScript 行列。
+    pub fn remap_error_text(&self, text: &str) -> String {
+        match remap_stack(text, &self.registry.borrow()) {
+            std::borrow::Cow::Owned(rewritten) => rewritten,
+            std::borrow::Cow::Borrowed(original) => original.to_string(),
         }
     }
 
@@ -95,15 +119,18 @@ impl TsModuleLoader {
             JsNativeError::typ().with_message(format!("无法读取 {}：{error}", path.display()))
         })?;
 
-        let output = Transpiler::transpile(&raw, &path, &TranspileConfig::default()).map_err(
-            |diagnostics| {
+        let output =
+            Transpiler::transpile(&raw, &path, &self.transpile).map_err(|diagnostics| {
                 JsNativeError::syntax().with_message(format!(
                     "转译 {} 失败：{}",
                     path.display(),
                     diagnostics.join("\n")
                 ))
-            },
-        )?;
+            })?;
+
+        if let Some(mapping) = output.sourcemap {
+            self.register_source_map(&path, mapping);
+        }
 
         let module = Module::parse(
             Source::from_bytes(&output.code).with_path(&path),

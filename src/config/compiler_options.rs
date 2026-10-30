@@ -41,6 +41,10 @@ pub struct CompilerOptions {
     /// 类型严格度开关。生效：`true` 时向内置 tsrs 类型检查器传入 `--strict`。
     pub strict: bool,
 
+    /// 是否产出源码映射。生效：运行期错误栈帧的行列据此反查回 TypeScript 源坐标。
+    /// 关闭时注册表为空，错误输出退回转译后 JS 坐标。
+    pub source_map: bool,
+
     /// TypeScript `paths` 映射。不采用：命中时给出明确告警并指向 `imports`。
     pub paths: Option<serde_json::Value>,
 
@@ -59,6 +63,7 @@ impl Default for CompilerOptions {
             use_define_for_class_fields: true,
             lib: vec![String::from("es2025"), String::from("web")],
             strict: false,
+            source_map: true,
             paths: None,
             base_url: None,
         }
@@ -99,6 +104,7 @@ mod tests {
         assert_eq!(options.target, "es2025");
         assert_eq!(options.jsx, "preserve");
         assert!(options.use_define_for_class_fields);
+        assert!(options.source_map);
     }
 
     #[test]

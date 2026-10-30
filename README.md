@@ -102,7 +102,8 @@ src/
 | `compilerOptions.module` | `esnext` | 仅提示 | mio 只有 ES Module 一种形态 |
 | `compilerOptions.moduleResolution` | `mio` | 仅提示 | 解析规则固定 |
 | `compilerOptions.lib` | `["es2025","web"]` | 仅提示 | 类型面，非运行时面 |
-| `compilerOptions.strict` | `false` | 仅提示 | 类型检查由外部 tsgo 负责 |
+| `compilerOptions.strict` | `false` | 生效 | `true` 时向内置 tsrs 类型检查器传入 `--strict` |
+| `compilerOptions.sourceMap` | `true` | 生效 | 运行期错误栈帧行列反查回 TypeScript 源；关闭则退回 JS 坐标 |
 | `compilerOptions.paths` | 无 | 不采用 | 改用 `imports`，命中时告警 |
 | `compilerOptions.baseUrl` | 无 | 不采用 | 改用 `imports`，命中时告警 |
 | `include` / `exclude` / `files` | 空 | 生效 | 通配模式，支持 `*`、`?`、`**`；`files` 命中优先，`exclude` 次之 |

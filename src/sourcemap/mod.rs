@@ -4,5 +4,7 @@
 //! 阶段 B 自研前端会直接携带原始位置，本层届时退化为恒等映射。
 
 mod registry;
+mod stack;
 
-pub use registry::SourceMapRegistry;
+pub use registry::{SourceMapEntry, SourceMapRegistry};
+pub use stack::remap_stack;

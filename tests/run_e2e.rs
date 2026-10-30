@@ -637,3 +637,100 @@ fn check_accepts_top_level_await_and_fetch_types() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn runtime_error_stack_points_to_typescript_lines() {
+    let dir = unique_dir("sourcemap-run");
+    let file = dir.join("drift.ts");
+    // 前 6 行类型声明会被整行擦除：调用点 TS 第 13 行对应 JS 第 6 行，两坐标必然不同。
+    std::fs::write(
+        &file,
+        "interface Widget {\n  name: string;\n}\n\ntype Label = string;\n\n\
+         function boom(w: Widget): Label {\n  undefinedFunctionCall();\n  return w.name;\n}\n\n\
+         const widget: Widget = { name: \"x\" };\nboom(widget);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "运行期错误应退出码 1");
+    assert!(
+        stderr.contains("drift.ts:13:1"),
+        "主帧应指回 TS 第 13 行（JS 坐标是第 6 行）：{stderr}"
+    );
+    assert!(
+        !stderr.contains("drift.ts:6:1"),
+        "不应残留 JS 坐标的调用帧：{stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn runtime_error_in_imported_module_maps_to_its_source() {
+    let dir = unique_dir("sourcemap-import");
+    // 抛错语句放进函数：Boa 对模块顶层直接抛错不记录行列（输出 `?:?`），
+    // 函数帧才有坐标；顶层调用帧则始终以 `?:?` 出现。
+    std::fs::write(
+        dir.join("dep.ts"),
+        "type P = number;\n\nfunction kaboom(): P {\n  undefinedCall();\n  return 1;\n}\n\nexport const x: P = kaboom();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { x } from './dep.ts';\nconsole.log(x);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("main.ts").to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "子模块运行期错误应退出码 1");
+    // kaboom 调用在 dep.ts 第 8 行（擦除后 JS 在第 5 行）；
+    // `at kaboom` 帧由 Boa 指向函数声明行，不做断言。
+    assert!(
+        stderr.contains("dep.ts:8:"),
+        "子文件错误应反查回 dep.ts 第 8 行：{stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sourcemap_disabled_falls_back_to_js_coordinates() {
+    let dir = unique_dir("sourcemap-off");
+    std::fs::write(
+        dir.join("mio.json"),
+        "{ \"compilerOptions\": { \"sourceMap\": false } }",
+    )
+    .unwrap();
+    let file = dir.join("drift.ts");
+    std::fs::write(
+        &file,
+        "interface Widget {\n  name: string;\n}\n\ntype Label = string;\n\n\
+         function boom(w: Widget): Label {\n  undefinedFunctionCall();\n  return w.name;\n}\n\n\
+         const widget: Widget = { name: \"x\" };\nboom(widget);\n",
+    )
+    .unwrap();
+
+    let output = run(&[
+        "-c",
+        dir.join("mio.json").to_str().unwrap(),
+        "run",
+        file.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "关闭映射不影响错误退出码");
+    assert!(
+        stderr.contains("ReferenceError"),
+        "错误本体仍完整报告：{stderr}"
+    );
+    // 注册表为空 → 主帧退回 JS 坐标（第 6 行；开启映射时是 TS 第 13 行）。
+    assert!(
+        stderr.contains("drift.ts:6:"),
+        "无映射时应退回 JS 坐标：{stderr}"
+    );
+    assert!(!stderr.contains("drift.ts:13:"), "不应再做反查：{stderr}");
+    assert!(!stderr.contains("panic"), "不应 panic：{stderr}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

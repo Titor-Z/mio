@@ -72,6 +72,7 @@ pub const KNOWN_COMPILER_OPTION_KEYS: &[&str] = &[
     "useDefineForClassFields",
     "lib",
     "strict",
+    "sourceMap",
     "paths",
     "baseUrl",
 ];
