@@ -52,6 +52,54 @@ fn run_erases_types_and_prints() {
 }
 
 #[test]
+fn check_reports_type_error_with_exit_one() {
+    let dir = unique_dir("check-bad");
+    let file = dir.join("bad.ts");
+    std::fs::write(
+        &file,
+        "interface User { name: string }\n\
+         const u: User = { name: 'ada' };\n\
+         const n: number = u.name;\n",
+    )
+    .unwrap();
+
+    let output = run(&["check", file.to_str().unwrap()]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(output.status.code(), Some(1), "含类型错误应以 1 退出");
+    assert!(
+        combined.contains("TS2322"),
+        "应报出 TS2322 类型不兼容：{combined}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_passes_clean_file() {
+    let dir = unique_dir("check-good");
+    let file = dir.join("good.ts");
+    std::fs::write(
+        &file,
+        "interface User { name: string }\n\
+         const u: User = { name: 'ada' };\n\
+         console.log(u.name);\n",
+    )
+    .unwrap();
+
+    let output = run(&["check", file.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "无类型错误时 check 应成功退出：{output:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn run_evaluates_enum_members() {
     let dir = unique_dir("enum");
     let file = dir.join("en.ts");

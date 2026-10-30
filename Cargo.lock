@@ -915,7 +915,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "tsrs_checker",
+ "tsrs_execute",
 ]
 
 [[package]]
@@ -2044,6 +2044,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsrs_compiler"
+version = "0.20.1"
+dependencies = [
+ "rayon",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_binder",
+ "tsrs_checker",
+ "tsrs_contentmapper",
+ "tsrs_core",
+ "tsrs_declarations",
+ "tsrs_diagnostics",
+ "tsrs_module",
+ "tsrs_modulespecifiers",
+ "tsrs_parser",
+ "tsrs_printer",
+ "tsrs_scanner",
+ "tsrs_sourcemap",
+ "tsrs_spanmap",
+ "tsrs_transformers",
+ "tsrs_tsoptions",
+ "tsrs_vfs",
+]
+
+[[package]]
+name = "tsrs_contentmapper"
+version = "0.20.1"
+dependencies = [
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_ipc",
+ "tsrs_parser",
+ "tsrs_spanmap",
+ "tsrs_tsoptions",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "tsrs_core"
 version = "0.20.1"
 dependencies = [
@@ -2061,10 +2101,81 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsrs_declarations"
+version = "0.20.1"
+dependencies = [
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_checker",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_modulespecifiers",
+ "tsrs_printer",
+ "tsrs_scanner",
+ "tsrs_transformers",
+ "tsrs_tsoptions",
+]
+
+[[package]]
 name = "tsrs_diagnostics"
 version = "0.20.1"
 dependencies = [
  "rustc-hash",
+]
+
+[[package]]
+name = "tsrs_execute"
+version = "0.20.1"
+dependencies = [
+ "libc",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_compiler",
+ "tsrs_contentmapper",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_fswatch",
+ "tsrs_incremental",
+ "tsrs_ipc",
+ "tsrs_tsoptions",
+ "tsrs_vfs",
+]
+
+[[package]]
+name = "tsrs_fswatch"
+version = "0.20.1"
+dependencies = [
+ "libc",
+ "rustc-hash",
+ "tsrs_core",
+]
+
+[[package]]
+name = "tsrs_incremental"
+version = "0.20.1"
+dependencies = [
+ "bitflags",
+ "rayon",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_binder",
+ "tsrs_checker",
+ "tsrs_compiler",
+ "tsrs_contentmapper",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_module",
+ "tsrs_tsoptions",
+ "tsrs_vfs",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tsrs_ipc"
+version = "0.20.1"
+dependencies = [
+ "rustc-hash",
+ "tsrs_core",
 ]
 
 [[package]]
@@ -2152,6 +2263,21 @@ version = "0.20.1"
 dependencies = [
  "bitflags",
  "tsrs_core",
+]
+
+[[package]]
+name = "tsrs_transformers"
+version = "0.20.1"
+dependencies = [
+ "bitflags",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_binder",
+ "tsrs_checker",
+ "tsrs_core",
+ "tsrs_printer",
+ "tsrs_scanner",
+ "tsrs_tsoptions",
 ]
 
 [[package]]

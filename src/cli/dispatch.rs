@@ -18,7 +18,7 @@ mio —— TypeScript 一等公民的运行时
   mio run <file>        执行 TypeScript 或 JavaScript 文件
   mio eval <code>       执行一段内联源码
   mio repl              启动交互式求值环境
-  mio check <file>      仅做类型检查（依赖外部 tsgo）
+  mio check <file>      仅做类型检查（内置 tsrs 编译器，无外部依赖）
   mio task [name]       执行 mio.json 中声明的任务
 
 选项:
@@ -44,7 +44,40 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
         Command::Run { path } => run_file(path, config),
         Command::Eval { source } => eval_source(source),
         Command::Repl => Err(not_implemented("repl")),
-        Command::Check { path } => Err(not_implemented(&format!("check {}", path.display()))),
+        Command::Check { path } => check_file(path),
+    }
+}
+
+/// 执行一次纯类型检查：复用 fork 进来的 tsrs 编译器驱动 `tsrs_execute::command_line`。
+///
+/// 诊断由编译器自身按 `file:line:col error TSxxxx` 格式写到 stdout/stderr；
+/// 本函数只负责选择参数、在足够大的栈线程里跑（类型检查递归很深）、把退出码翻译成结果。
+fn check_file(path: &std::path::Path) -> CliResult {
+    use tsrs_execute::{execute, sys, tsc};
+
+    let path = path.to_path_buf();
+    let status = std::thread::Builder::new()
+        .stack_size(512 << 20)
+        .spawn(move || {
+            let host: &'static dyn tsc::System = Box::leak(Box::new(sys::new_system()));
+            let result = execute::command_line(
+                host,
+                vec![
+                    String::from("--noEmit"),
+                    path.to_string_lossy().into_owned(),
+                ],
+            );
+            tsc::System::flush(host);
+            result.status
+        })
+        .map_err(|error| format!("无法启动类型检查线程：{error}"))?
+        .join()
+        .map_err(|_| String::from("类型检查线程异常退出"))?;
+
+    match status {
+        tsc::ExitStatus::Success => Ok(()),
+        tsc::ExitStatus::NotImplemented => Err(String::from("该类型检查请求尚未被编译器支持")),
+        other => Err(format!("类型检查未通过（退出码 {}）", other as i32)),
     }
 }
 
