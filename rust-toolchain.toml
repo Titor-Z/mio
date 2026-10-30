@@ -1,6 +1,6 @@
 # 依赖的 OXC 与 Boa 版本均已在稳定版 Rust 上验证可编译
-# 1.97.1 满足 oxc 0.156 的 rust-version 要求（1.97.0），无需 nightly
+# `compiler/`（fork 自 tsrs）要求 1.99；1.99.1 仍满足 oxc 0.156（rust-version 1.97.0）与 boa 0.22，无需 nightly
+# profile=default 自带 rustfmt/clippy；不用 `components = [...]` 显式声明，避开 rustup 补装 rustfmt-preview 时的 cargo-fmt 冲突
 [toolchain]
-channel = "1.97.1"
-profile = "minimal"
-components = ["rustfmt", "clippy"]
+channel = "1.99.1"
+profile = "default"

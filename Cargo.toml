@@ -33,6 +33,11 @@ oxc_semantic = "0.156"
 oxc_span = "0.156"
 oxc_transformer = "0.156"
 
+# TypeScript 类型检查与编译器前端（fork 自 oxc-project/tsrs，源码见 `compiler/`）。
+# 跨 workspace 的 path 依赖：mio 只引所需的 `tsrs_checker`（及其内部传递闭包），
+# 其余 compiler crate（LSP / declarations / incremental 等）按需再纳入。
+tsrs_checker = { path = "compiler/crates/tsrs_checker" }
+
 # 通用工具
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
