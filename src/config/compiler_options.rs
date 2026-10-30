@@ -35,10 +35,10 @@ pub struct CompilerOptions {
     pub use_define_for_class_fields: bool,
 
     /// 类型声明库列表，例如 `es2025`、`web`。
-    /// 仅提示：本版本不做类型检查，因此不影响运行时。
+    /// 仅提示：本版本由 tsrs 默认库决定，不传递该列表给编译器。
     pub lib: Vec<String>,
 
-    /// 类型严格度开关。仅提示：类型检查由外部 tsgo 负责，mio 不解释本字段。
+    /// 类型严格度开关。生效：`true` 时向内置 tsrs 类型检查器传入 `--strict`。
     pub strict: bool,
 
     /// TypeScript `paths` 映射。不采用：命中时给出明确告警并指向 `imports`。

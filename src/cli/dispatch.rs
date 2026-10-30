@@ -44,29 +44,30 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
         Command::Run { path } => run_file(path, config),
         Command::Eval { source } => eval_source(source),
         Command::Repl => Err(not_implemented("repl")),
-        Command::Check { path } => check_file(path),
+        Command::Check { path } => check_file(path, config),
     }
 }
 
 /// 执行一次纯类型检查：复用 fork 进来的 tsrs 编译器驱动 `tsrs_execute::command_line`。
 ///
+/// `--noEmit` 与文件路径由参数拼接；`compilerOptions.strict == true` 时附加 `--strict`。
 /// 诊断由编译器自身按 `file:line:col error TSxxxx` 格式写到 stdout/stderr；
 /// 本函数只负责选择参数、在足够大的栈线程里跑（类型检查递归很深）、把退出码翻译成结果。
-fn check_file(path: &std::path::Path) -> CliResult {
+fn check_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
     use tsrs_execute::{execute, sys, tsc};
 
+    let strict = config.config.compiler_options.strict;
     let path = path.to_path_buf();
     let status = std::thread::Builder::new()
         .stack_size(512 << 20)
         .spawn(move || {
             let host: &'static dyn tsc::System = Box::leak(Box::new(sys::new_system()));
-            let result = execute::command_line(
-                host,
-                vec![
-                    String::from("--noEmit"),
-                    path.to_string_lossy().into_owned(),
-                ],
-            );
+            let mut args = vec![String::from("--noEmit")];
+            if strict {
+                args.push(String::from("--strict"));
+            }
+            args.push(path.to_string_lossy().into_owned());
+            let result = execute::command_line(host, args);
             tsc::System::flush(host);
             result.status
         })
@@ -81,11 +82,15 @@ fn check_file(path: &std::path::Path) -> CliResult {
     }
 }
 
-/// 执行一个源码文件：读取 → 转译擦除类型 → 以 ES Module 语义求值。
+/// 执行一个源码文件：可选的预置类型检查 → 读取 → 转译擦除类型 → 以 ES Module 语义求值。
 ///
 /// `mio.json` 的 `imports` 与配置目录会组装为 [`ModuleResolver`]，传给引擎后
 /// 内部的 `TsModuleLoader` 就能识别 Import Maps 别名与基准目录。
+/// 若配置 `check.typecheck == "on"`（或命令行 `--typecheck`），则先跑类型检查，任一诊断即中断。
 fn run_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
+    if config.config.check.typecheck == "on" {
+        check_file(path, config)?;
+    }
     let resolver = config
         .config
         .build_resolver()?

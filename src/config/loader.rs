@@ -376,13 +376,6 @@ impl ConfigLoader {
             diagnostics.push(Diagnostic::warn(field, message));
         }
 
-        if config.compiler_options.strict {
-            diagnostics.push(Diagnostic::warn(
-                "compilerOptions.strict",
-                "类型严格度由外部 tsgo 解释，mio 不读取该字段",
-            ));
-        }
-
         if !config.scopes.is_empty() {
             diagnostics.push(Diagnostic::warn(
                 "scopes",
@@ -505,21 +498,18 @@ mod tests {
     #[test]
     fn expands_braced_and_bare_env_references() {
         let mut environment = MapEnvironment::default();
-        environment.set("MIO_TSGO", "/opt/tsgo");
+        environment.set("MIO_OUT", "/tmp/out");
 
         let dir = write_config(
             "env",
             CONFIG_FILE_NAME,
-            r#"{ "check": { "tsgoPath": "${MIO_TSGO}/bin" } }"#,
+            r#"{ "build": { "outDir": "${MIO_OUT}/dist" } }"#,
         );
 
         let loaded = ConfigLoader::load(&dir, None, &ConfigOverride::default(), &environment)
             .expect("应加载成功");
 
-        assert_eq!(
-            loaded.config.check.tsgo_path.as_deref(),
-            Some("/opt/tsgo/bin")
-        );
+        assert_eq!(loaded.config.build.out_dir, "/tmp/out/dist");
     }
 
     #[test]
@@ -527,7 +517,7 @@ mod tests {
         let dir = write_config(
             "env_missing",
             CONFIG_FILE_NAME,
-            r#"{ "check": { "tsgoPath": "$MIO_ABSENT" } }"#,
+            r#"{ "build": { "outDir": "$MIO_ABSENT" } }"#,
         );
 
         let loaded = ConfigLoader::load(
@@ -538,16 +528,13 @@ mod tests {
         )
         .expect("应加载成功");
 
-        assert_eq!(
-            loaded.config.check.tsgo_path.as_deref(),
-            Some("$MIO_ABSENT")
-        );
+        assert_eq!(loaded.config.build.out_dir, "$MIO_ABSENT");
     }
 
     #[test]
     fn cli_override_beats_environment_and_file() {
         let mut environment = MapEnvironment::default();
-        environment.set("MIO_TYPECHECK", "tsgo");
+        environment.set("MIO_TYPECHECK", "on");
 
         let dir = write_config(
             "priority",

@@ -162,18 +162,15 @@ impl Default for ModuleConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct CheckConfig {
-    /// `off` 表示不检查，`tsgo` 表示执行前调用外部 tsgo。生效。
+    /// `off` 表示不检查；`on` 表示 `mio run` 执行前先用内置 tsrs 编译器做类型检查。生效。
+    /// 无论本字段取值，显式的 `mio check` 命令总会执行类型检查。
     pub typecheck: String,
-
-    /// tsgo 可执行文件路径，支持 `$ENV` 与环境变量引用。生效。
-    pub tsgo_path: Option<String>,
 }
 
 impl Default for CheckConfig {
     fn default() -> Self {
         Self {
             typecheck: String::from("off"),
-            tsgo_path: None,
         }
     }
 }

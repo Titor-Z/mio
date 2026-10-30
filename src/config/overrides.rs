@@ -8,7 +8,7 @@
 /// 字段使用 `Option` 语义：`None` 表示「不覆盖，沿用下层结果」。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigOverride {
-    /// 类型检查开关，取值 `tsgo` 或 `off`。对应 `--typecheck` / `--no-typecheck`。
+    /// 类型检查开关，取值 `on` 或 `off`。对应 `--typecheck` / `--no-typecheck`。
     pub typecheck: Option<String>,
 
     /// 事件循环超时毫秒数。对应 `--timeout <ms>`。
@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn setting_typecheck_makes_override_non_empty() {
         let overrides = ConfigOverride {
-            typecheck: Some(String::from("tsgo")),
+            typecheck: Some(String::from("on")),
             ..ConfigOverride::default()
         };
         assert!(!overrides.is_empty());

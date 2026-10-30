@@ -7,7 +7,7 @@
 //! - `mio run <file>`   执行一个 TypeScript 或 JavaScript 文件
 //! - `mio eval <code>`  执行一段内联源码
 //! - `mio repl`         交互式求值
-//! - `mio check <file>` 仅做类型检查（依赖外部 tsgo）
+//! - `mio check <file>` 仅做类型检查（内置 tsrs 编译器，无外部依赖）
 //! - `mio task <name>`  执行 `mio.json` 中声明的任务
 
 mod args;

@@ -79,6 +79,100 @@ fn check_reports_type_error_with_exit_one() {
 }
 
 #[test]
+fn run_with_typecheck_flag_aborts_on_type_error() {
+    let dir = unique_dir("run-check-abort");
+    let file = dir.join("bad.ts");
+    std::fs::write(
+        &file,
+        "interface User { name: string }\n\
+         const u: User = { name: 'ada' };\n\
+         const n: number = u.name;\n\
+         console.log('SHOULD_NOT_PRINT');\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", "--typecheck", file.to_str().unwrap()]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "--typecheck 下含错应中断执行"
+    );
+    assert!(combined.contains("TS2322"), "应报出 TS2322：{combined}");
+    assert!(
+        !combined.contains("SHOULD_NOT_PRINT"),
+        "不应推进到运行时：{combined}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_default_does_not_typecheck() {
+    let dir = unique_dir("run-no-check");
+    let file = dir.join("bad.ts");
+    // 同样的类型错误文件：默认不设 typecheck 时，应直接运行到运行时（类型擦除后合法）。
+    std::fs::write(
+        &file,
+        "interface User { name: string }\n\
+         const u: User = { name: 'ada' };\n\
+         const n: number = u.name;\n\
+         console.log('RAN');\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "默认不开检查时不应阻断：{output:?}"
+    );
+    assert_eq!(stdout.trim(), "RAN");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_uses_strict_from_config() {
+    let dir = unique_dir("check-strict");
+    // 写入一个开启 strict 的配置，与一个含“隐式 any”的文件。
+    std::fs::write(
+        dir.join("mio.json"),
+        "{ \"compilerOptions\": { \"strict\": true } }",
+    )
+    .unwrap();
+    let file = dir.join("any.ts");
+    std::fs::write(
+        &file,
+        "function greet(name) { return 'Hi ' + name; }\nconsole.log(greet);\n",
+    )
+    .unwrap();
+
+    let output = run(&[
+        "check",
+        "-c",
+        dir.join("mio.json").to_str().unwrap(),
+        file.to_str().unwrap(),
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(output.status.code(), Some(1), "strict 下隐式 any 应不通过");
+    assert!(
+        combined.contains("TS7006"),
+        "应报出 TS7006 隐式 any：{combined}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn check_passes_clean_file() {
     let dir = unique_dir("check-good");
     let file = dir.join("good.ts");

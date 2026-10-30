@@ -77,7 +77,7 @@ impl Cli {
             match word {
                 "--version" | "-v" => early = Some(Command::Version),
                 "--help" | "-h" => early = Some(Command::Help),
-                "--typecheck" => overrides.typecheck = Some(String::from("tsgo")),
+                "--typecheck" => overrides.typecheck = Some(String::from("on")),
                 "--no-typecheck" => overrides.typecheck = Some(String::from("off")),
                 "--config" | "-c" => {
                     let value = words
