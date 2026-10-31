@@ -10,5 +10,10 @@
 //! 4. 取消用 `AbortSignal`
 //! 5. 字符串按 USVString 处理
 //! 6. 错误用 `TypeError` / `RangeError` 等标准类型
+//!
+//! `fetch` 现状（阶段 A）：请求支持 method/headers/文本与 Uint8Array body；
+//! 取消走 `AbortController`（约定 4：Promise 粒度拒绝，socket 自然排空）；
+//! 响应提供 `text()`/`json()`/`arrayBuffer()`（约定 1：二进制以 Uint8Array 承载）。
+//! 仍不支持：数组对形式 headers、FormData、ReadableStream body 族。
 
 pub mod fetch;

@@ -4,12 +4,40 @@
 //! 引擎绑定层把 [`ResponseData`] 翻译为 JS `Response` 对象。
 //! 线程模型：每个请求在一个工作线程上阻塞完成，结果经 channel 送回宿主事件循环。
 //!
-//! 当前范围：仅 GET；4xx/5xx 是**成功结果**（fetch 语义只在网络/协议层失败时才 reject）。
+//! 当前范围：任意 method + 请求头 + 字节 body；4xx/5xx 是**成功结果**
+//! （fetch 语义只在网络/协议层失败时才 reject）。
+//! 取消不在本层：引擎层对已登记的挂起 Promise 立即拒绝，工作线程读完即丢弃结果。
 
 use std::io::Read;
 
 /// 一次 fetch 的终局：成功携带 [`ResponseData`]，失败携带应包装为 `TypeError` 的消息。
 pub type FetchOutcome = Result<ResponseData, String>;
+
+/// 解析后的请求：引擎层把 JS `fetch(url, init)` 拆成此纯数据描述后交给工作线程。
+#[derive(Debug, Clone)]
+pub struct FetchRequest {
+    /// 目标 URL。
+    pub url: String,
+    /// HTTP 方法（大写），默认 `GET`。
+    pub method: String,
+    /// 请求头（原样键名，ureq 自身大小写不敏感）。
+    pub headers: Vec<(String, String)>,
+    /// 请求体字节；`None` 表示无 body。
+    pub body: Option<Vec<u8>>,
+}
+
+impl FetchRequest {
+    /// 构造一个无 init 的 GET 请求。
+    #[must_use]
+    pub fn new(url: String) -> Self {
+        Self {
+            url,
+            method: String::from("GET"),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+}
 
 /// HTTP 响应快照：状态、合并后的头、已完整读入内存的 body。
 #[derive(Debug, Clone)]
@@ -52,15 +80,25 @@ impl ResponseData {
     }
 }
 
-/// 执行一次阻塞 GET。不抛出：一切失败都归一为 [`FetchOutcome`] 的 `Err` 消息。
-pub fn fetch_get(url: &str) -> FetchOutcome {
-    match ureq::get(url).call() {
-        Ok(response) => read_response(url, response),
+/// 执行一次阻塞请求。不抛出：一切失败都归一为 [`FetchOutcome`] 的 `Err` 消息。
+pub fn fetch_execute(request: &FetchRequest) -> FetchOutcome {
+    let mut agent_request = ureq::request(&request.method, &request.url);
+    for (name, value) in &request.headers {
+        agent_request = agent_request.set(name, value);
+    }
+
+    let result = match &request.body {
+        Some(bytes) => agent_request.send_bytes(bytes),
+        None => agent_request.call(),
+    };
+
+    match result {
+        Ok(response) => read_response(&request.url, response),
         Err(error) => {
             let message = error.to_string();
             match error.into_response() {
                 // Status 错误同样携带完整响应：按 fetch 语义视为成功。
-                Some(response) => read_response(url, response),
+                Some(response) => read_response(&request.url, response),
                 None => Err(format!("fetch failed: {message}")),
             }
         }
@@ -138,7 +176,28 @@ mod tests {
 
     #[test]
     fn invalid_url_produces_err_without_network() {
-        let outcome = fetch_get("not-a-url");
+        let outcome = fetch_execute(&FetchRequest::new(String::from("not-a-url")));
         assert!(outcome.is_err(), "非法 URL 必须走失败路径");
+    }
+
+    #[test]
+    fn get_request_defaults() {
+        let request = FetchRequest::new(String::from("http://127.0.0.1:1/"));
+        assert_eq!(request.method, "GET");
+        assert!(request.headers.is_empty());
+        assert!(request.body.is_none());
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn request_defaults_to_get_without_body() {
+        let request = FetchRequest::new("http://127.0.0.1/x".to_string());
+        assert_eq!(request.method, "GET");
+        assert!(request.headers.is_empty());
+        assert!(request.body.is_none());
     }
 }

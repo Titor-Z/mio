@@ -18,7 +18,7 @@ fn mio_binary() -> PathBuf {
 /// 其余 200 回显路径；`/slow` 接受连接但不回应，用于触发宿主超时。
 /// 每个连接响应后关闭（`connection: close`）。服务器随测试进程结束自然回收。
 fn spawn_mock_server() -> u16 {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock 服务器应能绑定 ephemeral 端口");
@@ -34,12 +34,26 @@ fn spawn_mock_server() -> u16 {
             if reader.read_line(&mut request_line).is_err() {
                 continue;
             }
-            // 耗尽请求头，避免过早断开影响客户端发送。
+            let method = request_line
+                .split_whitespace()
+                .next()
+                .unwrap_or("GET")
+                .to_string();
+            // 耗尽请求头（避免过早断开影响客户端发送），顺便取 content-length 与 x-test。
+            let mut content_length = 0usize;
+            let mut test_header = String::new();
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
                     Ok(_) => {
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                        if let Some(value) = lower.strip_prefix("x-test:") {
+                            test_header = value.trim().to_string();
+                        }
                         if line.trim().is_empty() {
                             break;
                         }
@@ -60,6 +74,14 @@ fn spawn_mock_server() -> u16 {
                 });
                 continue;
             }
+            let mut body_buffer = vec![0u8; content_length];
+            if content_length > 0 && reader.read_exact(&mut body_buffer).is_err() {
+                continue;
+            }
+            let request_body = String::from_utf8_lossy(&body_buffer).into_owned();
+            // 回显值直接嵌进 JSON 响应：转义反斜杠与双引号（测试可控范围内够用）。
+            let request_body = request_body.replace('\\', "\\\\").replace('"', "\\\"");
+            let test_header = test_header.replace('\\', "\\\\").replace('"', "\\\"");
             let (status, body, extra): (&str, String, String) = match path.as_str() {
                 "/hello" => (
                     "200 OK",
@@ -72,6 +94,14 @@ fn spawn_mock_server() -> u16 {
                     String::from("content-type: application/json\r\n"),
                 ),
                 "/missing" => ("404 Not Found", String::from("nope"), String::new()),
+                // 回显方法、请求体与 x-test 头；值均为可控 ASCII，无需 JSON 转义。
+                "/echo" => (
+                    "200 OK",
+                    format!(
+                        r#"{{"method":"{method}","body":"{request_body}","xTest":"{test_header}"}}"#
+                    ),
+                    String::from("content-type: application/json\r\n"),
+                ),
                 other => ("200 OK", format!("path={other}"), String::new()),
             };
             let response = format!(
@@ -731,6 +761,178 @@ fn sourcemap_disabled_falls_back_to_js_coordinates() {
     );
     assert!(!stderr.contains("drift.ts:13:"), "不应再做反查：{stderr}");
     assert!(!stderr.contains("panic"), "不应 panic：{stderr}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_post_sends_method_headers_and_string_body() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-post");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const r = await fetch('http://127.0.0.1:{port}/echo', {{\n\
+             \x20 method: 'POST',\n\
+             \x20 headers: {{ 'X-Test': 'abc', 'content-type': 'application/json' }},\n\
+             \x20 body: JSON.stringify({{ a: 1 }}),\n\
+             }});\n\
+             const data = await r.json();\n\
+             console.log(data.method, data.body, data.xTest);\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "POST 用例应成功退出：{output:?}");
+    assert_eq!(stdout.trim(), "POST {\"a\":1} abc");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_post_accepts_uint8array_body() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-uint8-body");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const payload = new Uint8Array([104, 101, 108, 108, 111]);\n\
+             const r = await fetch('http://127.0.0.1:{port}/echo', {{ method: 'POST', body: payload }});\n\
+             const data = await r.json();\n\
+             console.log(data.body, data.method);\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "Uint8Array body 用例应成功退出：{output:?}"
+    );
+    assert_eq!(stdout.trim(), "hello POST");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_arraybuffer_returns_uint8array() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-arraybuffer");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const r = await fetch('http://127.0.0.1:{port}/hello');\n\
+             const b = await r.arrayBuffer();\n\
+             console.log(b instanceof Uint8Array, b.byteLength, b[0]);\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "arrayBuffer 用例应成功退出：{output:?}"
+    );
+    // "hello mio"：9 字节，首字节 'h' = 104。
+    assert_eq!(stdout.trim(), "true 9 104");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn abort_controller_rejects_inflight_fetch_with_abort_error() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-abort");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const ac = new AbortController();\n\
+             console.log('before', ac.signal.aborted);\n\
+             const p = fetch('http://127.0.0.1:{port}/slow', {{ signal: ac.signal }});\n\
+             ac.abort();\n\
+             console.log('after', ac.signal.aborted);\n\
+             try {{\n\
+             \x20   await p;\n\
+             \x20   console.log('NOT_REJECTED');\n\
+             }} catch (e) {{\n\
+             \x20   console.log('aborted', e.name === 'AbortError');\n\
+             }}\n\
+             const ok = await fetch('http://127.0.0.1:{port}/hello');\n\
+             console.log('still', ok.status);\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "abort 用例应成功退出：{output:?}");
+    assert_eq!(
+        stdout.trim(),
+        "before false\nafter true\naborted true\nstill 200"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_with_already_aborted_signal_rejects_immediately() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-abort-pre");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const ac = new AbortController();\n\
+             ac.abort();\n\
+             fetch('http://127.0.0.1:{port}/hello', {{ signal: ac.signal }}).then(\n\
+             \x20 () => console.log('RESOLVED'),\n\
+             \x20 (e) => console.log('pre', e.name),\n\
+             );\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "预 abort 用例应成功退出：{output:?}"
+    );
+    assert_eq!(stdout.trim(), "pre AbortError");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_get_with_body_throws_type_error() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-get-body");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "try {{\n\
+             \x20   fetch('http://127.0.0.1:{port}/hello', {{ body: 'x' }});\n\
+             \x20   console.log('NO_THROW');\n\
+             }} catch (e) {{\n\
+             \x20   console.log('throws', e instanceof TypeError);\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "同步抛错被捕获：{output:?}");
+    assert_eq!(stdout.trim(), "throws true");
 
     std::fs::remove_dir_all(&dir).ok();
 }
