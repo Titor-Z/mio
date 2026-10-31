@@ -5,8 +5,9 @@
 //! 一个实现 [`Engine`] 的类型，上游命令行与加载逻辑不受影响。
 //!
 //! 当前实现覆盖里程碑 1 的垂直切片：读取单文件→转译擦除类型→以 ES Module 语义求值
-//! →驱动微任务与宿主事件循环（在途 fetch 的等待与 settle）；入口模块预填入 [`TsModuleLoader`]
-//! 缓存，相对 `import` 经解析后递归转译加载；`@std/*` 内建模块与 `fetch`/`console` 全局已接入。
+//! →驱动微任务与宿主事件循环（在途 fetch 的等待与 settle、定时器到期触发）；
+//! 入口模块预填入 [`TsModuleLoader`] 缓存，相对 `import` 经解析后递归转译加载；
+//! `@std/*` 内建模块与 `fetch`/`console`/定时器全局已接入。
 
 use std::path::Path;
 use std::rc::Rc;
@@ -21,6 +22,7 @@ use boa_engine::{Context, JsError, JsObject, JsValue, NativeFunction, Source, js
 
 use super::fetch::{self as engine_fetch, FetchResult};
 use super::loader::TsModuleLoader;
+use super::timers as engine_timers;
 use super::{Engine, EngineError};
 use crate::resolver::ModuleResolver;
 use crate::transpiler::{TranspileConfig, Transpiler};
@@ -63,6 +65,7 @@ impl BoaEngine {
             .expect("构建 Boa Context 失败");
         install_console(&mut context);
         let fetch_rx = engine_fetch::install(&mut context);
+        engine_timers::install(&mut context);
         Self {
             context,
             loader,
@@ -166,31 +169,68 @@ impl BoaEngine {
         Ok(String::new())
     }
 
-    /// 宿主事件循环：只要还有在途 fetch，就阻塞等待完成、settle、再排空微任务。
+    /// 宿主事件循环：只要有在途 fetch 或待触发定时器就继续运转。
     ///
-    /// 预算耗尽（`run.timeoutMs`）时，所有在途请求以 `TypeError` 拒绝，
-    /// 避免永久挂起；之后的 `run_jobs` 让拒绝进入用户 catch 或成为未处理拒绝。
+    /// 阻塞等待取两者优先：fetch 完成消息（到达即 settle）或最近定时器到期（到点即
+    /// 触发）；每次推进后都排空微任务队列。预算耗尽（`run.timeoutMs`）时在途请求
+    /// 以 `TypeError` 拒绝、定时器全部丢弃，避免永久挂起。
     fn drive_event_loop(&mut self) -> Result<(), EngineError> {
         let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        while engine_fetch::has_pending() {
+        loop {
             let budget = deadline.saturating_duration_since(Instant::now());
-            match self.fetch_rx.recv_timeout(budget) {
-                Ok(first) => {
-                    let mut batch = vec![first];
-                    while let Ok(more) = self.fetch_rx.try_recv() {
-                        batch.push(more);
+            if budget.is_zero() {
+                engine_fetch::reject_all_pending("fetch timed out", &mut self.context);
+                engine_timers::clear_all();
+                self.run_jobs()?;
+                return Ok(());
+            }
+
+            let has_fetch = engine_fetch::has_pending();
+            let timer_wait = engine_timers::next_deadline()
+                .map(|due| due.saturating_duration_since(Instant::now()).min(budget));
+            if !has_fetch && timer_wait.is_none() {
+                return Ok(());
+            }
+            // 无在途 fetch 时不能阻塞收消息，只能等定时器；无定时器时只等预算内的 fetch。
+            let wait = timer_wait.unwrap_or(budget);
+            if has_fetch {
+                match self.fetch_rx.recv_timeout(wait) {
+                    Ok(first) => {
+                        let mut batch = vec![first];
+                        while let Ok(more) = self.fetch_rx.try_recv() {
+                            batch.push(more);
+                        }
+                        engine_fetch::settle(&batch, &mut self.context);
+                        self.run_jobs()?;
                     }
-                    engine_fetch::settle(&batch, &mut self.context);
-                    self.run_jobs()?;
+                    Err(RecvTimeoutError::Timeout) => {
+                        // wait 恒不大于 budget：到点即预算耗尽，否则是定时器到期。
+                        if Instant::now() >= deadline {
+                            engine_fetch::reject_all_pending("fetch timed out", &mut self.context);
+                            engine_timers::clear_all();
+                            self.run_jobs()?;
+                            return Ok(());
+                        }
+                        self.fire_timers_and_drain()?;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    engine_fetch::reject_all_pending("fetch timed out", &mut self.context);
-                    self.run_jobs()?;
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
+            } else {
+                // 只剩定时器：睡到期再触发。
+                std::thread::sleep(wait);
+                self.fire_timers_and_drain()?;
             }
         }
+        // 通道断开：放弃等待，在途请求随进程自然终局。
         Ok(())
+    }
+
+    /// 触发到期定时器并排空随后的微任务；错误经源码映射包装为引擎错误。
+    fn fire_timers_and_drain(&mut self) -> Result<(), EngineError> {
+        engine_timers::fire_due(&mut self.context).map_err(|error| {
+            EngineError::new("定时器", self.loader.remap_error_text(&error.to_string()))
+        })?;
+        self.run_jobs()
     }
 }
 

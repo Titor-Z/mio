@@ -12,6 +12,7 @@ mod boa_engine;
 mod error;
 mod fetch;
 mod loader;
+mod timers;
 
 pub use boa_engine::BoaEngine;
 pub use error::EngineError;

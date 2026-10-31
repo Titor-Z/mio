@@ -936,3 +936,76 @@ fn fetch_get_with_body_throws_type_error() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn timers_fire_in_order_and_process_exits_when_drained() {
+    let dir = unique_dir("timers-order");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "// 微任务先于定时器；queueMicrotask 与 Promise 同队列同序；\n\
+         // clearTimeout 取消一次性、clearInterval 在回调内自我取消。\n\
+         console.log('sync');\n\
+         queueMicrotask(() => console.log('qm'));\n\
+         Promise.resolve().then(() => console.log('promise'));\n\
+         setTimeout(() => console.log('to0'), 0);\n\
+         setTimeout((msg: string) => console.log('to10', msg), 10, 'extra');\n\
+         let count = 0;\n\
+         const iv = setInterval(() => {\n\
+         \x20 count++;\n\
+         \x20 console.log('tick', count);\n\
+         \x20 if (count === 3) {\n\
+         \x20   clearInterval(iv);\n\
+         \x20 }\n\
+         }, 20);\n\
+         const cancelled = setTimeout(() => console.log('NEVER'), 5);\n\
+         clearTimeout(cancelled);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "定时器用例应成功退出：{output:?}");
+    assert_eq!(
+        stdout.trim(),
+        "sync\nqm\npromise\nto0\nto10 extra\ntick 1\ntick 2\ntick 3"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn event_loop_wakes_for_timers_while_fetch_in_flight() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("timers-with-fetch");
+    // 预算压到 300ms：/slow 不会回，定时器必须在 fetch 在途期间准点触发。
+    std::fs::write(
+        dir.join("mio.json"),
+        "{\n  \"run\": { \"timeoutMs\": 300 }\n}\n",
+    )
+    .unwrap();
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "setTimeout(() => console.log('tick-30'), 30);\n\
+             try {{\n\
+             \x20   await fetch('http://127.0.0.1:{port}/slow');\n\
+             \x20   console.log('RESOLVED');\n\
+             }} catch (e) {{\n\
+             \x20   console.log('rejected');\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "定时器+fetch 混合用例应成功退出：{output:?}"
+    );
+    assert_eq!(stdout.trim(), "tick-30\nrejected");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
