@@ -1123,3 +1123,94 @@ fn web_types_textencoder_blob_formdata_semantics() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn microtask_storm_is_stopped_by_run_budget() {
+    let dir = unique_dir("microtask-storm");
+    std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 800 } }").unwrap();
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "export {};\n\
+         const boom = (): void => {\n\
+         \x20 queueMicrotask(boom);\n\
+         };\n\
+         boom();\n\
+         console.log('entered host loop');\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let output = run(&[
+        "-c",
+        dir.join("mio.json").to_str().unwrap(),
+        "run",
+        file.to_str().unwrap(),
+    ]);
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "自递归的微任务必须被预算拦下，而不是无限排空：{output:?}"
+    );
+    assert!(stderr.contains("预算"), "错误应指明预算耗尽：{stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "entered host loop",
+        "脚本体的输出应先于预算中止：{stdout}"
+    );
+    assert!(
+        elapsed.as_secs() < 5,
+        "预算 800ms 却在 {elapsed:?} 后才结束：看门狗未生效"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn finite_microtask_chain_still_completes_under_budget() {
+    let dir = unique_dir("microtask-chain");
+    std::fs::write(
+        dir.join("mio.json"),
+        "{ \"run\": { \"timeoutMs\": 15000 } }",
+    )
+    .unwrap();
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "export {};\n\
+         const walk = async (): Promise<number> => {\n\
+         \x20 let hops = 0;\n\
+         \x20 for (let i = 0; i < 20000; i++) {\n\
+         \x20   await Promise.resolve();\n\
+         \x20   hops++;\n\
+         \x20 }\n\
+         \x20 return hops;\n\
+         };\n\
+         setTimeout(() => console.log('timer runs after the queue drains'), 5);\n\
+         console.log('hops', await walk());\n",
+    )
+    .unwrap();
+
+    let output = run(&[
+        "-c",
+        dir.join("mio.json").to_str().unwrap(),
+        "run",
+        file.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "有限长度的微任务接力不得被看门狗误伤：{output:?}"
+    );
+    // 微任务优先于定时器（与 Node 一致）：接力排空后定时器才有机会。
+    assert_eq!(
+        stdout.trim(),
+        "hops 20000\ntimer runs after the queue drains"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

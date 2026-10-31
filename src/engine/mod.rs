@@ -10,6 +10,7 @@
 
 mod blob;
 mod boa_engine;
+mod budget;
 mod encoding;
 mod error;
 mod fetch;
