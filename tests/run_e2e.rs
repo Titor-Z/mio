@@ -1254,3 +1254,45 @@ fn performance_now_is_monotonic_with_sub_millisecond_resolution() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn zero_period_interval_yields_between_rounds_instead_of_spinning() {
+    let dir = unique_dir("interval-zero");
+    // 预算 200ms：只要 interval(0) 在同一轮里自旋，事件循环就永远回不到预算检查。
+    std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 200 } }").unwrap();
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "export {};\n\
+         let ticks = 0;\n\
+         setInterval(() => {\n\
+         \x20 ticks++;\n\
+         \x20 if (ticks === 1) {\n\
+         \x20   console.log('first tick');\n\
+         \x20 }\n\
+         }, 0);\n",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let output = run(&[
+        "-c",
+        dir.join("mio.json").to_str().unwrap(),
+        "run",
+        file.to_str().unwrap(),
+    ]);
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "零周期 interval 应正常终局：{output:?}"
+    );
+    assert!(stdout.contains("first tick"), "至少应触发一次：{stdout}");
+    assert!(
+        elapsed.as_secs() < 5,
+        "预算 200ms 却在 {elapsed:?} 后才结束：同一轮里自旋未让位"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
