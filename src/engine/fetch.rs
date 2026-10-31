@@ -15,13 +15,15 @@ use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use boa_engine::object::FunctionObjectBuilder;
-use boa_engine::object::builtins::{JsFunction, JsPromise, JsUint8Array};
+use boa_engine::object::builtins::{JsArrayBuffer, JsFunction, JsPromise, JsUint8Array};
 use boa_engine::property::{Attribute, PropertyDescriptor, PropertyKey};
 use boa_engine::{
     Context, JsArgs, JsNativeError, JsObject, JsResult, JsValue, NativeFunction, js_string,
 };
 
 use crate::web::fetch::{self as webfetch, FetchOutcome, ResponseData};
+
+use super::{blob, url as engine_url};
 
 /// 一次请求的完成消息：请求序号 + HTTP 终局。
 pub(super) type FetchResult = (u64, FetchOutcome);
@@ -115,12 +117,19 @@ struct ParsedRequest {
 /// `body`（字符串或 Uint8Array）/ `signal`（本实现创建的 AbortSignal）。
 /// 不支持数组对形式的 headers 与 ReadableStream body（留待后续）。
 fn parse_request(args: &[JsValue], context: &mut Context) -> JsResult<ParsedRequest> {
-    let Some(url) = args.get_or_undefined(0).as_string() else {
-        return Err(JsNativeError::typ()
-            .with_message("fetch() expects a string URL")
-            .into());
+    // 入参接受字符串或本实现铸造的 URL 实例（读 href 快照）。
+    let url = match args.get_or_undefined(0).as_string() {
+        Some(string) => string.to_std_string_escaped(),
+        None => match engine_url::url_href(args.get_or_undefined(0), context)? {
+            Some(href) => href,
+            None => {
+                return Err(JsNativeError::typ()
+                    .with_message("fetch() expects a string URL or URL instance")
+                    .into());
+            }
+        },
     };
-    let mut request = webfetch::FetchRequest::new(url.to_std_string_escaped());
+    let mut request = webfetch::FetchRequest::new(url);
     let mut signal_id = None;
     let mut aborted = false;
 
@@ -190,19 +199,37 @@ fn parse_request(args: &[JsValue], context: &mut Context) -> JsResult<ParsedRequ
                 .with_message(format!("{} request cannot have a body", request.method))
                 .into());
         }
-        request.body = Some(if let Some(string) = body.as_string() {
-            string.to_std_string_escaped().into_bytes()
+        let (bytes, auto_content_type) = if let Some(string) = body.as_string() {
+            (string.to_std_string_escaped().into_bytes(), None)
+        } else if let Some((bytes, content_type)) = blob::body_from_registry(&body, context)? {
+            // FormData → multipart、Blob → 原始字节（规范各自的 content-type 兜底）。
+            (bytes, content_type)
         } else if let Some(object) = body.as_object() {
-            JsUint8Array::from_object(object.clone())
-                .map_err(|_| {
-                    JsNativeError::typ().with_message("body must be a string or Uint8Array")
-                })?
-                .to_vec(context)?
+            if let Ok(array) = JsUint8Array::from_object(object.clone()) {
+                (array.to_vec(context)?, None)
+            } else if let Ok(buffer) = JsArrayBuffer::from_object(object.clone()) {
+                (buffer.to_vec().unwrap_or_default(), None)
+            } else {
+                return Err(JsNativeError::typ()
+                    .with_message("body must be a string, Blob, FormData or buffer-like object")
+                    .into());
+            }
         } else {
             return Err(JsNativeError::typ()
-                .with_message("body must be a string or Uint8Array")
+                .with_message("body must be a string, Blob, FormData or buffer-like object")
                 .into());
-        });
+        };
+        request.body = Some(bytes);
+        if let Some(content_type) = auto_content_type
+            && !request
+                .headers
+                .iter()
+                .any(|(name, _)| name == "content-type")
+        {
+            request
+                .headers
+                .push(("content-type".to_string(), content_type));
+        }
     }
 
     let signal = init.get(js_string!("signal"), context)?;

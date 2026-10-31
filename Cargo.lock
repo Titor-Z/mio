@@ -995,6 +995,7 @@ dependencies = [
  "boa_engine",
  "boa_gc",
  "boa_parser",
+ "form_urlencoded",
  "oxc_allocator",
  "oxc_ast",
  "oxc_codegen",
@@ -1007,6 +1008,7 @@ dependencies = [
  "serde_json",
  "tsrs_execute",
  "ureq",
+ "url",
 ]
 
 [[package]]

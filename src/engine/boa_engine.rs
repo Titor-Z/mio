@@ -66,6 +66,9 @@ impl BoaEngine {
         install_console(&mut context);
         let fetch_rx = engine_fetch::install(&mut context);
         engine_timers::install(&mut context);
+        super::blob::install(&mut context);
+        super::encoding::install(&mut context);
+        super::url::install(&mut context);
         Self {
             context,
             loader,

@@ -29,7 +29,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-工具链固定为 Rust 1.97.1（见 `rust-toolchain.toml`）。OXC 0.156 与 Boa 0.22 均可在稳定版 Rust 上编译，无需 nightly。
+工具链固定为 Rust 1.99.1（见 `rust-toolchain.toml`）。OXC 0.156 与 Boa 0.22 均可在稳定版 Rust 上编译，无需 nightly。
 
 ## 使用
 
@@ -37,7 +37,7 @@ cargo fmt --check
 mio run app.ts         # 执行 TypeScript 文件
 mio eval "..."         # 执行内联源码
 mio repl               # 交互式求值
-mio check app.ts       # 仅类型检查（依赖外部 tsgo）
+mio check app.ts       # 仅类型检查（内置 tsrs 编译器）
 mio task <name>        # 执行 mio.json 声明的任务
 ```
 
@@ -113,8 +113,7 @@ src/
 | `stdlib.disable` | 空 | 生效 | 从全局注入中剔除的对象名 |
 | `module.root` | `.` | 生效 | 绝对说明符的基准目录 |
 | `module.extensions` | `.ts,.tsx,.mts,.js,.mjs,.json` | 生效 | 扩展名补全顺序 |
-| `check.typecheck` | `off` | 生效 | `off` 或 `tsgo` |
-| `check.tsgoPath` | 无 | 生效 | 支持 `$VAR` 与 `${VAR}` 展开 |
+| `check.typecheck` | `off` | 生效 | `off` 或 `on`；`on` 时 `mio run` 执行前先类型检查 |
 | `run.timeoutMs` | `30000` | 生效 | 事件循环超时 |
 | `build.outDir` | `.mio/cache` | 生效 | 预转译产物目录（里程碑 3） |
 | `build.sourcemap` | `true` | 生效 | 是否落盘源码映射（里程碑 3） |

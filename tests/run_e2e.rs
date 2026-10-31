@@ -42,11 +42,13 @@ fn spawn_mock_server() -> u16 {
             // 耗尽请求头（避免过早断开影响客户端发送），顺便取 content-length 与 x-test。
             let mut content_length = 0usize;
             let mut test_header = String::new();
+            let mut header_block = String::new();
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
                     Ok(_) => {
+                        header_block.push_str(&line);
                         let lower = line.to_ascii_lowercase();
                         if let Some(value) = lower.strip_prefix("content-length:") {
                             content_length = value.trim().parse().unwrap_or(0);
@@ -78,9 +80,9 @@ fn spawn_mock_server() -> u16 {
             if content_length > 0 && reader.read_exact(&mut body_buffer).is_err() {
                 continue;
             }
-            let request_body = String::from_utf8_lossy(&body_buffer).into_owned();
+            let request_body_raw = String::from_utf8_lossy(&body_buffer).into_owned();
             // 回显值直接嵌进 JSON 响应：转义反斜杠与双引号（测试可控范围内够用）。
-            let request_body = request_body.replace('\\', "\\\\").replace('"', "\\\"");
+            let request_body = request_body_raw.replace('\\', "\\\\").replace('"', "\\\"");
             let test_header = test_header.replace('\\', "\\\\").replace('"', "\\\"");
             let (status, body, extra): (&str, String, String) = match path.as_str() {
                 "/hello" => (
@@ -95,6 +97,12 @@ fn spawn_mock_server() -> u16 {
                 ),
                 "/missing" => ("404 Not Found", String::from("nope"), String::new()),
                 // 回显方法、请求体与 x-test 头；值均为可控 ASCII，无需 JSON 转义。
+                // 原样回显请求头与请求体：multipart 等含控制字符的内容走 text/plain 直传。
+                "/raw" => (
+                    "200 OK",
+                    format!("headers:{header_block}body:{request_body_raw}"),
+                    String::from("content-type: text/plain; charset=utf-8\r\n"),
+                ),
                 "/echo" => (
                     "200 OK",
                     format!(
@@ -1006,6 +1014,112 @@ fn event_loop_wakes_for_timers_while_fetch_in_flight() {
         "定时器+fetch 混合用例应成功退出：{output:?}"
     );
     assert_eq!(stdout.trim(), "tick-30\nrejected");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_accepts_url_instance_as_input() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-url-input");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const u = new URL('http://127.0.0.1:{port}/hello');\n\
+             const r = await fetch(u);\n\
+             console.log(r.status, await r.text());\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "URL 入参用例应成功退出：{output:?}"
+    );
+    assert_eq!(stdout.trim(), "200 hello mio");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_formdata_body_serializes_multipart_and_sets_content_type() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-formdata");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const fd = new FormData();\n\
+             fd.append('a', '1');\n\
+             const blob = new Blob(['XY'], {{ type: 'text/plain' }});\n\
+             fd.append('f', blob, 'n.txt');\n\
+             const r = await fetch('http://127.0.0.1:{port}/raw', {{ method: 'POST', body: fd }});\n\
+             const t = await r.text();\n\
+             console.log(\n\
+             \x20 t.includes('multipart/form-data; boundary=----MioFormBoundary'),\n\
+             \x20 t.includes('name=\"a\"'),\n\
+             \x20 t.includes('filename=\"n.txt\"'),\n\
+             \x20 t.includes('content-type: text/plain'),\n\
+             \x20 t.includes('XY'),\n\
+             );\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "FormData 用例应成功退出：{output:?}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "true true true true true",
+        "multipart 各要素应齐备：{stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn web_types_textencoder_blob_formdata_semantics() {
+    let dir = unique_dir("web-types");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "const enc = new TextEncoder();\n\
+         const bytes = enc.encode('中文a');\n\
+         const dec = new TextDecoder();\n\
+         console.log('roundtrip', dec.decode(bytes), bytes.length);\n\
+         const blob = new Blob(['hello', ' 世界'], { type: 'Text/Plain' });\n\
+         console.log('blob', blob.size, blob.type, await blob.text());\n\
+         const ab = await blob.arrayBuffer();\n\
+         console.log('ab', ab instanceof Uint8Array, ab[0]);\n\
+         const fd = new FormData();\n\
+         fd.append('a', '1');\n\
+         fd.append('a', '2');\n\
+         fd.append('file', blob, 'note.txt');\n\
+         console.log('fd', fd.get('a'), fd.getAll('a').length, fd.has('nope'));\n\
+         const file = fd.get('file') as File;\n\
+         console.log('file', file.name, file.type, file.size);\n\
+         fd.set('a', '9');\n\
+         console.log('after set', fd.getAll('a').join(','));\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "Web 类型用例应成功退出：{output:?}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "roundtrip 中文a 7\nblob 12 text/plain hello 世界\nab true 104\nfd 1 2 false\nfile note.txt text/plain 12\nafter set 9"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
