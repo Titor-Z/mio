@@ -15,6 +15,7 @@ mod encoding;
 mod error;
 mod fetch;
 mod loader;
+mod performance;
 mod support;
 mod timers;
 mod url;

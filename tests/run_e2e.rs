@@ -1214,3 +1214,43 @@ fn finite_microtask_chain_still_completes_under_budget() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn performance_now_is_monotonic_with_sub_millisecond_resolution() {
+    let dir = unique_dir("performance-now");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "export {};\n\
+         const samples: number[] = [];\n\
+         for (let i = 0; i < 200; i++) {\n\
+         \x20 samples.push(performance.now());\n\
+         }\n\
+         let strict = true;\n\
+         for (let i = 1; i < samples.length; i++) {\n\
+         \x20 if (samples[i] <= samples[i - 1]) {\n\
+         \x20   strict = false;\n\
+         \x20 }\n\
+         }\n\
+         const t0 = performance.now();\n\
+         while (performance.now() - t0 < 30) {}\n\
+         console.log('strictlyIncreasing', strict);\n\
+         console.log('busyWait>=30', performance.now() - t0 >= 30);\n\
+         console.log('subMillisecond', (performance.now() % 1) !== 0);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "performance 用例应成功退出：{output:?}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "strictlyIncreasing true\nbusyWait>=30 true\nsubMillisecond true",
+        "连续 200 次读数必须严格递增且带亚毫秒位：{stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
