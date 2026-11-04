@@ -5,8 +5,10 @@
 //!
 //! 与 `config_e2e.rs` 不同，本测试不依赖任何配置，仅用临时目录隔离用例。
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn mio_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mio"))
@@ -1309,6 +1311,74 @@ json 1
 nocontent 204 0
 arr 1, 2 1
 forEach content-type=text/plain,x-a=9"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn serve_responds_to_real_http_request() {
+    // 固定高位端口：全组仅此一测用 serve，不会与临时端口 mock 服务器相碰。
+    let port: u16 = 18099;
+    let dir = unique_dir("serve");
+    let file = dir.join("server.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "serve((req) => new Response('hi ' + req.url, {{ status: 201, headers: {{ 'content-type': 'text/plain' }} }}), {{ port: {port} }});
+",
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(mio_binary())
+        .args(["run", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("启动 mio 服务器进程");
+
+    // 轮询直到端口就绪（最多约 5s），或子进程提前退出则携输出报错。
+    let mut client = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let out = child.wait_with_output().expect("回收已退出的子进程");
+                    panic!(
+                        "serve 进程提前退出（{status}）：stdout={} stderr={}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    client
+        .write_all(
+            b"GET /ping HTTP/1.1
+host: x
+
+",
+        )
+        .unwrap();
+    // 服务端每连接一请求即 `connection: close`，read_to_string 拿到完整响应后 EOF。
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(response.starts_with("HTTP/1.1 201"), "{response}");
+    assert!(
+        response.contains("content-type: text/plain"),
+        "应含 content-type：{response}"
+    );
+    assert!(
+        response.ends_with("hi http://x/ping"),
+        "body 应为回显 url：{response}"
     );
 
     std::fs::remove_dir_all(&dir).ok();

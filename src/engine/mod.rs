@@ -14,6 +14,7 @@ mod budget;
 mod encoding;
 mod error;
 mod fetch;
+mod http;
 mod loader;
 mod performance;
 mod response;

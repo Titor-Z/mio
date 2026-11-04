@@ -23,10 +23,21 @@ use boa_engine::{
 
 use crate::web::fetch::{self as webfetch, FetchOutcome, ResponseData};
 
-use super::{blob, url as engine_url};
+use super::{blob, http as engine_http, url as engine_url};
 
 /// 一次请求的完成消息：请求序号 + HTTP 终局。
 pub(super) type FetchResult = (u64, FetchOutcome);
+
+/// 宿主事件循环唯一等待源上的一种事件：fetch 完成，或进来的 HTTP 请求。
+///
+/// 这是 Deno/Bun「一个循环、一个事件源」形态的落地：定时器不占通道（靠 `poll`/timeout
+/// 驱动），fetch 完成与工作线程无关地经此通道回来，serve 进来的请求也走同一条。
+pub(super) enum LoopEvent {
+    /// 一个 fetch 工作线程的终局。
+    Fetch(FetchResult),
+    /// 服务端线程收到一条完整请求，等待引擎线程同步处理并回线。
+    Server(engine_http::ServerInbound),
+}
 
 /// 尚未 settle 的 Promise 两端句柄（仅存活于引擎线程）。
 struct PendingFetch {
@@ -41,13 +52,13 @@ thread_local! {
     static PENDING: RefCell<Vec<PendingFetch>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static NEXT_SIGNAL_ID: Cell<usize> = const { Cell::new(1) };
-    static SENDER: RefCell<Option<Sender<FetchResult>>> = const { RefCell::new(None) };
+    static SENDER: RefCell<Option<Sender<LoopEvent>>> = const { RefCell::new(None) };
     /// 本引擎创建的 AbortSignal 登记表：序号 → signal 对象（abort 回调只捕获序号）。
     static SIGNALS: RefCell<Vec<(usize, JsObject)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// 安装全局 `fetch` 与 `AbortController`，返回宿主事件循环用来收取完成结果的接收端。
-pub(super) fn install(context: &mut Context) -> Receiver<FetchResult> {
+pub(super) fn install(context: &mut Context) -> Receiver<LoopEvent> {
     let (sender, receiver) = mpsc::channel();
     SENDER.with(|slot| *slot.borrow_mut() = Some(sender.clone()));
     install_abort_controller(context);
@@ -86,7 +97,7 @@ pub(super) fn install(context: &mut Context) -> Receiver<FetchResult> {
             .ok_or_else(|| JsNativeError::typ().with_message("fetch channel unavailable"))?;
         std::thread::spawn(move || {
             let outcome = webfetch::fetch_execute(&parsed.request);
-            let _ = sender.send((id, outcome));
+            let _ = sender.send(LoopEvent::Fetch((id, outcome)));
         });
 
         Ok(promise.into())
@@ -100,6 +111,11 @@ pub(super) fn install(context: &mut Context) -> Receiver<FetchResult> {
         .expect("安装 fetch 全局失败");
 
     receiver
+}
+
+/// 取当前事件循环的完成通道发送端（供 `serve` 服务端线程克隆）。
+pub(super) fn sender() -> Option<Sender<LoopEvent>> {
+    SENDER.with(|slot| slot.borrow().clone())
 }
 
 /// `parse_request` 的产出：纯数据请求 + 取消关联信息。

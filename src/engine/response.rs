@@ -15,6 +15,8 @@ use boa_engine::{
     Context, JsArgs, JsNativeError, JsObject, JsResult, JsSymbol, JsValue, js_string,
 };
 
+use crate::web::net::server::ResponseSpec;
+
 use super::support::{
     array_iterator, attach_method, global_static_function, register_constructor, set_property,
     to_text,
@@ -548,4 +550,27 @@ fn response_array_buffer(
         .ok_or_else(|| JsNativeError::typ().with_message("Response data unavailable"))?;
     let view = JsUint8Array::from_iter(data.body, context)?;
     Ok(JsPromise::resolve(JsValue::from(view), context)?.into())
+}
+
+/// 以 Rust 头表铸造一个 `Headers` 实例（供 `serve` 构造 `Request.headers`）。
+pub(super) fn new_headers(entries: HeaderEntries, context: &mut Context) -> JsResult<JsObject> {
+    new_headers_object(entries, context)
+}
+
+/// 从本实现铸造的 `Response` 抽出 [`ResponseSpec`]（供 `serve` 写线）。
+///
+/// 非本实现 Response（无 `_responseId`）返回 [`None`]。
+pub(super) fn response_to_spec(value: &JsValue, context: &mut Context) -> Option<ResponseSpec> {
+    let object = value.as_object()?.clone();
+    let id = object
+        .get(js_string!("_responseId"), context)
+        .ok()?
+        .as_number()?;
+    let data = read_response(id as usize)?;
+    Some(ResponseSpec {
+        status: data.status,
+        status_text: data.status_text,
+        headers: merged_pairs(read_headers(data.headers_id)),
+        body: data.body,
+    })
 }

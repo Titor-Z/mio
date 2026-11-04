@@ -24,7 +24,8 @@ use boa_engine::property::{Attribute, PropertyDescriptor};
 use boa_engine::{Context, JsError, JsObject, JsValue, NativeFunction, Source, js_string};
 
 use super::budget::{StopKey, Watchdog, WatchdogHandle};
-use super::fetch::{self as engine_fetch, FetchResult};
+use super::fetch::{self as engine_fetch, FetchResult, LoopEvent};
+use super::http as engine_http;
 use super::loader::TsModuleLoader;
 use super::timers as engine_timers;
 use super::{Engine, EngineError};
@@ -36,7 +37,7 @@ pub struct BoaEngine {
     context: Context,
     loader: Rc<TsModuleLoader>,
     transpile: TranspileConfig,
-    fetch_rx: Receiver<FetchResult>,
+    fetch_rx: Receiver<LoopEvent>,
     timeout_ms: u64,
     /// Boa 微任务执行器的取消令牌写入口：看门狗据此掐断排不到空的微任务风暴。
     job_stop: StopKey,
@@ -79,6 +80,7 @@ impl BoaEngine {
             .expect("构建 Boa Context 失败");
         install_console(&mut context);
         let fetch_rx = engine_fetch::install(&mut context);
+        engine_http::install(&mut context);
         engine_timers::install(&mut context);
         super::blob::install(&mut context);
         super::encoding::install(&mut context);
@@ -212,6 +214,7 @@ impl BoaEngine {
     ///
     /// 阻塞等待取两者优先：fetch 完成消息（到达即 settle）或最近定时器到期（到点即
     /// 触发）；每次推进后都排空微任务队列。
+    /// 阻塞等待取三者优先：fetch 完成、进来的请求、或最近定时器到期；每次推进都排空微任务。
     fn drive_event_loop(&mut self, deadline: Instant) -> Result<(), EngineError> {
         loop {
             let budget = deadline.saturating_duration_since(Instant::now());
@@ -220,39 +223,54 @@ impl BoaEngine {
             }
 
             let has_fetch = engine_fetch::has_pending();
+            let has_serve = engine_http::is_listening();
             let timer_wait = engine_timers::next_deadline()
                 .map(|due| due.saturating_duration_since(Instant::now()).min(budget));
-            if !has_fetch && timer_wait.is_none() {
+            if !has_fetch && !has_serve && timer_wait.is_none() {
                 return Ok(());
             }
-            // 无在途 fetch 时不能阻塞收消息，只能等定时器；无定时器时只等预算内的 fetch。
+            // 单一等待点：事件通道（fetch 完成 + 进来的请求）或定时器超时，先到者唤醒。
             let wait = timer_wait.unwrap_or(budget);
-            if has_fetch {
-                match self.fetch_rx.recv_timeout(wait) {
-                    Ok(first) => {
-                        let mut batch = vec![first];
-                        while let Ok(more) = self.fetch_rx.try_recv() {
-                            batch.push(more);
-                        }
-                        engine_fetch::settle(&batch, &mut self.context);
-                        self.run_jobs_checked()?;
+            match self.fetch_rx.recv_timeout(wait) {
+                Ok(first) => {
+                    let mut batch = vec![first];
+                    while let Ok(more) = self.fetch_rx.try_recv() {
+                        batch.push(more);
                     }
-                    Err(RecvTimeoutError::Timeout) => {
-                        // wait 恒不大于 budget：到点即预算耗尽，否则是定时器到期。
-                        if Instant::now() >= deadline {
-                            return self.finish_with_timeout();
-                        }
-                        self.fire_timers_and_drain()?;
-                    }
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    self.dispatch(batch)?;
+                    self.run_jobs_checked()?;
                 }
-            } else {
-                // 只剩定时器：睡到期再触发。
-                std::thread::sleep(wait);
-                self.fire_timers_and_drain()?;
+                Err(RecvTimeoutError::Timeout) => {
+                    // wait 恒不大于 budget：到点即预算耗尽，否则是定时器到期。
+                    if Instant::now() >= deadline {
+                        return self.finish_with_timeout();
+                    }
+                    self.fire_timers_and_drain()?;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         // 通道断开：放弃等待，在途请求随进程自然终局。
+        Ok(())
+    }
+
+    /// 分发一批事件：fetch 结果合并后 settle；进来的请求逐条**同步**交给 handler。
+    ///
+    /// 顺序：先把 fetch 结果 settle（可能入队微任务），再处理 server（调用 JS）；
+    /// 二者产生的微任务统一交由调用方随后的 `run_jobs_checked` 排空。
+    fn dispatch(&mut self, events: Vec<LoopEvent>) -> Result<(), EngineError> {
+        let mut fetches: Vec<FetchResult> = Vec::new();
+        for event in events {
+            match event {
+                LoopEvent::Fetch(result) => fetches.push(result),
+                LoopEvent::Server(inbound) => {
+                    engine_http::dispatch_server(inbound, &mut self.context)
+                }
+            }
+        }
+        if !fetches.is_empty() {
+            engine_fetch::settle(&fetches, &mut self.context);
+        }
         Ok(())
     }
 
