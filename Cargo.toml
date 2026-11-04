@@ -43,8 +43,9 @@ rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# HTTP 客户端（fetch 的阻塞式实现；阶段 A 不引入异步运行时，线程包装后由宿主事件循环收取结果）
-ureq = "2"
+# 非阻塞 IO 多路复用（fetch 的 socket 层）。本 crate 自己就叫 mio，故重命名为 reactor
+# 以免与项目同名混淆；选它而非 polling 的理由是跨平台 Waker（DNS 辅助线程唤醒 poll 用）。
+reactor = { package = "mio", version = "1", features = ["net", "os-poll"] }
 
 # WHATWG URL 解析（url crate 的 Parser 即规范状态机实现）与 application/x-www-form-urlencoded
 # 编解码（URLSearchParams 的序列化族）

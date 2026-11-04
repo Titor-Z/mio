@@ -24,4 +24,5 @@
 
 pub mod fetch;
 pub mod form_data;
+pub mod net;
 pub mod url;
