@@ -26,7 +26,7 @@ use crate::web::net::server::{self as webhttp, ResponseSpec};
 
 use super::fetch::{self as engine_fetch, LoopEvent};
 use super::response;
-use super::support::{set_property, to_text};
+use super::support::{attach_method, global_static_function, set_property, to_text};
 
 /// 一条进来的请求：处理器序号 + 请求纯数据 + 回线发送端。
 pub(super) struct ServerInbound {
@@ -47,11 +47,19 @@ struct PendingServer {
 /// 当前在跑的服务器数量：>0 时事件循环保持存活（即便无在途 fetch/定时器）。
 static LISTENING: AtomicUsize = AtomicUsize::new(0);
 
+/// 一个已登记、待 handler 异步读取的请求体。
+struct RequestBody {
+    bytes: Vec<u8>,
+}
+
 thread_local! {
     /// `serve()` 注册的处理器表，按序号索引。
     static HANDLERS: RefCell<Vec<JsFunction>> = const { RefCell::new(Vec::new()) };
     /// 异步 handler 挂起表：Promise 落定后据此回线。
     static PENDING_SERVER: RefCell<Vec<PendingServer>> = const { RefCell::new(Vec::new()) };
+    /// 请求体登记表：序号 → 字节 + content-type（`_requestId` 关联，供 `req.json()` 等读）。
+    static BODIES: RefCell<Vec<(usize, RequestBody)>> = const { RefCell::new(Vec::new()) };
+    static NEXT_BODY_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
 }
 
 /// 是否仍有在监听的服务器（事件循环据此决定存活）。
@@ -198,9 +206,10 @@ pub(super) fn abandon_pending() {
     }
 }
 
-/// 从解析出的请求构造标准形态的 `Request`（v1：method / url / headers）。
+/// 从解析出的请求构造标准形态的 `Request`（method / url / headers / 异步体访问器）。
 ///
-/// `url` 按 WHATWG 为绝对式；体不进 `Request`（规范要求异步 `body`/`text()` 读取，另议）。
+/// `url` 按 WHATWG 为绝对式；体已解析入内存，按序号登记，`text()`/`json()`/`arrayBuffer()`
+/// 经 `this._requestId` 回查（同 `Blob` 模式，Boa 0.22 无 `host_data` 可用）。
 fn build_request(request: &ParsedRequest, context: &mut Context) -> JsResult<JsValue> {
     let head = &request.head;
     let host = head.header("host").unwrap_or("localhost");
@@ -211,7 +220,28 @@ fn build_request(request: &ParsedRequest, context: &mut Context) -> JsResult<JsV
     };
     let url = format!("http://{host}{target}");
 
+    // 登记请求体，拿序号回指。
+    let id = NEXT_BODY_ID.with(|cell| {
+        let next = cell.get();
+        cell.set(next + 1);
+        next
+    });
+    BODIES.with(|table| {
+        table.borrow_mut().push((
+            id,
+            RequestBody {
+                bytes: request.body.clone(),
+            },
+        ))
+    });
+
     let object = JsObject::default(context.intrinsics());
+    set_property(
+        &object,
+        js_string!("_requestId").into(),
+        JsValue::from(id as u32),
+        context,
+    );
     set_property(
         &object,
         js_string!("method").into(),
@@ -231,12 +261,78 @@ fn build_request(request: &ParsedRequest, context: &mut Context) -> JsResult<JsV
         headers.into(),
         context,
     );
+    set_property(&object, js_string!("body").into(), JsValue::null(), context);
 
-    // 请求体以同步可读的 Uint8Array 附于 `body`（v1 取舍：标准 body 是流，异步支持后再换）。
-    let body = JsUint8Array::from_iter(request.body.clone(), context)?;
-    set_property(&object, js_string!("body").into(), body.into(), context);
+    for name in ["text", "json", "arrayBuffer"] {
+        attach_method(&object, name, request_method(name), context);
+    }
 
     Ok(object.into())
+}
+
+/// 取本实现 `Request` 的请求体字节；非本实现（无 `_requestId`）报错。
+fn request_body(this: &JsValue, context: &mut Context) -> JsResult<RequestBody> {
+    let Some(object) = this.as_object() else {
+        return Err(JsNativeError::typ()
+            .with_message("method must be called on Request")
+            .into());
+    };
+    let id = object.get(js_string!("_requestId"), context)?;
+    let id = id
+        .as_number()
+        .ok_or_else(|| JsNativeError::typ().with_message("method must be called on Request"))?
+        as usize;
+    BODIES.with(|table| {
+        table
+            .borrow()
+            .iter()
+            .find(|(existing, _)| *existing == id)
+            .map(|(_, body)| RequestBody {
+                bytes: body.bytes.clone(),
+            })
+            .ok_or_else(|| {
+                JsNativeError::typ()
+                    .with_message("request body unavailable")
+                    .into()
+            })
+    })
+}
+
+fn request_method(name: &str) -> fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue> {
+    match name {
+        "text" => request_text,
+        "json" => request_json,
+        "arrayBuffer" => request_array_buffer,
+        _ => unreachable!("未知的 request 方法"),
+    }
+}
+
+/// `Request.text()`：已缓冲字节 → UTF-8 文本的已完成 Promise。
+fn request_text(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let body = request_body(this, context)?;
+    let text = String::from_utf8_lossy(&body.bytes).into_owned();
+    Ok(JsPromise::resolve(JsValue::from(js_string!(text.as_str())), context)?.into())
+}
+
+/// `Request.json()`：已缓冲字节 → `JSON.parse` 的已完成 Promise。
+fn request_json(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let body = request_body(this, context)?;
+    let text = String::from_utf8_lossy(&body.bytes).into_owned();
+    let parse = global_static_function(context, "JSON", "parse")?;
+    let json = context.global_object().get(js_string!("JSON"), context)?;
+    let parsed = parse.call(&json, &[JsValue::from(js_string!(text.as_str()))], context)?;
+    Ok(JsPromise::resolve(parsed, context)?.into())
+}
+
+/// `Request.arrayBuffer()`：已缓冲字节 → Uint8Array 的已完成 Promise。
+fn request_array_buffer(
+    this: &JsValue,
+    _args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let body = request_body(this, context)?;
+    let view = JsUint8Array::from_iter(body.bytes, context)?;
+    Ok(JsPromise::resolve(JsValue::from(view), context)?.into())
 }
 
 /// 从 `serve(handler, { port, hostname })` 读监听地址；缺省绑 `127.0.0.1:0`（临时端口）。

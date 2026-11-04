@@ -1447,6 +1447,68 @@ fn serve_async_handler_awaits_fetch() {
 }
 
 #[test]
+fn serve_handler_reads_request_body() {
+    // handler 里 `await req.json()` 读 POST 体：验证请求体解析→登记→异步访问器全链路。
+    let port: u16 = 18102;
+    let dir = unique_dir("serve-body");
+    let file = dir.join("server.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "serve(async (req) => {{
+  const data = await req.json();
+  return new Response('got:' + data.name + '/' + data.n);
+}}, {{ port: {port} }});
+",
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(mio_binary())
+        .args(["run", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("启动 mio 服务器进程");
+
+    let mut client = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let out = child.wait_with_output().expect("回收");
+                    panic!(
+                        "serve 进程提前退出（{status}）：stderr={}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    let payload = r#"{"name":"ada","n":7}"#;
+    let request = format!(
+        "POST /submit HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+        payload.len()
+    );
+    client.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.ends_with("got:ada/7"),
+        "应回显 POST 的 JSON 字段：{response}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn microtask_storm_is_stopped_by_run_budget() {
     let dir = unique_dir("microtask-storm");
     std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 800 } }").unwrap();
