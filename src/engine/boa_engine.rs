@@ -224,9 +224,10 @@ impl BoaEngine {
 
             let has_fetch = engine_fetch::has_pending();
             let has_serve = engine_http::is_listening();
+            let has_pending_handler = engine_http::has_pending();
             let timer_wait = engine_timers::next_deadline()
                 .map(|due| due.saturating_duration_since(Instant::now()).min(budget));
-            if !has_fetch && !has_serve && timer_wait.is_none() {
+            if !has_fetch && !has_serve && !has_pending_handler && timer_wait.is_none() {
                 return Ok(());
             }
             // 单一等待点：事件通道（fetch 完成 + 进来的请求）或定时器超时，先到者唤醒。
@@ -238,7 +239,7 @@ impl BoaEngine {
                         batch.push(more);
                     }
                     self.dispatch(batch)?;
-                    self.run_jobs_checked()?;
+                    self.run_jobs_and_poll()?;
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // wait 恒不大于 budget：到点即预算耗尽，否则是定时器到期。
@@ -246,6 +247,8 @@ impl BoaEngine {
                         return self.finish_with_timeout();
                     }
                     self.fire_timers_and_drain()?;
+                    // 定时器驱动可能兑现了挂起的异步 handler。用同一扫描补一次回线。
+                    engine_http::poll_pending_server(&mut self.context);
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -286,6 +289,7 @@ impl BoaEngine {
             (self.job_stop)(false);
         }
         engine_fetch::reject_all_pending("fetch timed out", &mut self.context);
+        engine_http::abandon_pending();
         engine_timers::clear_all();
         self.run_jobs()
     }
@@ -312,6 +316,13 @@ impl BoaEngine {
             EngineError::new("定时器", self.loader.remap_error_text(&error.to_string()))
         })?;
         self.run_jobs_checked()
+    }
+
+    /// 排空微任务，随后扫描一次异步 handler 挂起表（fetch/定时器驱动的结果回线）。
+    fn run_jobs_and_poll(&mut self) -> Result<(), EngineError> {
+        self.run_jobs_checked()?;
+        engine_http::poll_pending_server(&mut self.context);
+        Ok(())
     }
 }
 

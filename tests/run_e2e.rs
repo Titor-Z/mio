@@ -1385,6 +1385,68 @@ host: x
 }
 
 #[test]
+fn serve_async_handler_awaits_fetch() {
+    // 服务端 handler 内部 `await fetch` 去拉 mock 服务——验证异步回线与 fetch 事件的协作。
+    let mock_port = spawn_mock_server();
+    let port: u16 = 18101;
+    let dir = unique_dir("serve-async");
+    let file = dir.join("server.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "serve(async (req) => {{
+  const res = await fetch('http://127.0.0.1:{mock_port}/json');
+  const data = await res.json();
+  return new Response('answer=' + data.answer);
+}}, {{ port: {port} }});
+",
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(mio_binary())
+        .args(["run", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("启动 mio 异步服务器进程");
+
+    let mut client = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let out = child.wait_with_output().expect("回收已退出的子进程");
+                    panic!(
+                        "serve 进程提前退出（{status}）：stdout={} stderr={}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    client
+        .write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.ends_with("answer=42"),
+        "异步 handler 应把 fetch 到的数据回线：{response}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn microtask_storm_is_stopped_by_run_budget() {
     let dir = unique_dir("microtask-storm");
     std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 800 } }").unwrap();

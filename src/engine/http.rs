@@ -1,15 +1,13 @@
 //! 全局 `serve` 的引擎绑定层（`boa_*` 只允许出现在本模块）。
 //!
 //! 线程模型（对齐 Deno/Bun「一个循环、一个事件源」）：`serve()` 另起一个服务端线程跑
-//! [`webhttp::serve_loop`]；每收到一条完整请求，就把 [`ServerInbound`]（含请求纯数据 +
-//! 一条回线 channel）塞进引擎的 [`LoopEvent::Server`] 通道，服务端线程**阻塞等待**引擎把
-//! 结果送回来。引擎线程在 [`dispatch_server`] 里**同步**调用 JS handler，取出 `Response`
-//! 拆成 [`webhttp::ResponseSpec`] 回线。全程只有一个等待点（事件通道 + 定时器超时），
-//! JS 线程不被任何 socket 阻塞。
+//! [`webhttp::serve_loop`]；每收到一条完整请求，就把 [`ServerInbound`]（请求纯数据 + 一条
+//! 回线 channel）塞进引擎的 [`LoopEvent::Server`] 通道，服务端线程**阻塞等待**结果。引擎线程
+//! 调用 JS handler：同步返回 `Response` 立即回线；返回 Promise 则挂进「待决服务器请求表」，
+//! 事件循环每轮排空微任务后扫描，落定再回线——于是 handler 里的 `await fetch(...)` 能正常完成。
 //!
-//! v1 边界：handler 必须**同步返回 `Response`**——异步 handler（返回 Promise，内部可
-//! `await fetch`）需要「挂起的服务器请求表」与 fetch 完成通道的深度协作，列为后续项；
-//! 检测到返回 thenable 时回 500 并给出明确原因，而非静默丢包。
+//! v1 边界：`Request` 暂不含标准 `body`/`text()`/`json()`（异步请求体的读取另议）；服务端
+//! 每连接处理一个请求即关（`connection: close`），keep-alive 与并发后续再开。
 
 use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -17,10 +15,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use boa_engine::object::FunctionObjectBuilder;
-use boa_engine::object::builtins::{JsFunction, JsUint8Array};
+use boa_engine::object::builtins::{JsFunction, JsPromise, JsUint8Array};
 use boa_engine::property::Attribute;
 use boa_engine::{
-    Context, JsArgs, JsNativeError, JsObject, JsResult, JsValue, NativeFunction, js_string,
+    Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsValue, NativeFunction, js_string,
 };
 
 use crate::web::net::http::ParsedRequest;
@@ -40,17 +38,30 @@ pub(super) struct ServerInbound {
     reply: mpsc::Sender<Result<ResponseSpec, String>>,
 }
 
+/// 一个挂起的异步 handler：回线端 + 其返回的 Promise（仅存活于引擎线程）。
+struct PendingServer {
+    reply: mpsc::Sender<Result<ResponseSpec, String>>,
+    promise: JsPromise,
+}
+
 /// 当前在跑的服务器数量：>0 时事件循环保持存活（即便无在途 fetch/定时器）。
 static LISTENING: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// `serve()` 注册的处理器表，按序号索引。
     static HANDLERS: RefCell<Vec<JsFunction>> = const { RefCell::new(Vec::new()) };
+    /// 异步 handler 挂起表：Promise 落定后据此回线。
+    static PENDING_SERVER: RefCell<Vec<PendingServer>> = const { RefCell::new(Vec::new()) };
 }
 
 /// 是否仍有在监听的服务器（事件循环据此决定存活）。
 pub(super) fn is_listening() -> bool {
     LISTENING.load(Ordering::SeqCst) > 0
+}
+
+/// 是否仍有挂起的异步 handler（其响应尚未回线）。
+pub(super) fn has_pending() -> bool {
+    PENDING_SERVER.with(|list| !list.borrow().is_empty())
 }
 
 /// 安装全局 `serve`。
@@ -84,7 +95,7 @@ pub(super) fn install(context: &mut Context) {
                 if sender.send(LoopEvent::Server(inbound)).is_err() {
                     return ResponseSpec::text(500, "engine unavailable");
                 }
-                // 阻塞等引擎同步处理完这一条。
+                // 阻塞等引擎回线（同步 handler 即时；异步 handler 待 Promise 落定）。
                 match reply_rx.recv() {
                     Ok(Ok(spec)) => spec,
                     Ok(Err(message)) => ResponseSpec::text(500, &message),
@@ -104,66 +115,92 @@ pub(super) fn install(context: &mut Context) {
         .expect("安装 serve 全局失败");
 }
 
-/// 引擎线程处理一条进来的请求：构造 `Request`、同步调用 handler、把 `Response` 回线。
+/// 引擎线程处理一条进来的请求：调用 handler，同步 `Response` 直接回线，Promise 挂起待决。
 ///
-/// 任何 handler 抛错或返回非 Response，都转成服务端线程的 500，绝不中断事件循环。
+/// 任何 handler 抛错或返回非 Response/Promise，都转成服务端线程的 500，绝不中断事件循环。
 pub(super) fn dispatch_server(inbound: ServerInbound, context: &mut Context) {
-    let outcome = run_handler(inbound.handler_id, &inbound.request, context);
-    let _ = inbound.reply.send(outcome);
-}
-
-/// 调用注册的第 `handler_id` 个处理器处理 `request`，产出 [`ResponseSpec`] 或错误消息。
-fn run_handler(
-    handler_id: usize,
-    request: &ParsedRequest,
-    context: &mut Context,
-) -> Result<ResponseSpec, String> {
-    let handler = HANDLERS.with(|list| list.borrow().get(handler_id).cloned());
-    let Some(handler) = handler else {
-        return Err("serve handler unavailable".to_owned());
+    let Some(handler) = HANDLERS.with(|list| list.borrow().get(inbound.handler_id).cloned()) else {
+        let _ = inbound
+            .reply
+            .send(Err("serve handler unavailable".to_owned()));
+        return;
     };
-
-    let request_value = match build_request(request, context) {
+    let request_value = match build_request(&inbound.request, context) {
         Ok(value) => value,
-        Err(error) => return Err(error.to_string()),
+        Err(error) => {
+            let _ = inbound.reply.send(Err(error.to_string()));
+            return;
+        }
     };
-
-    let result = handler
-        .call(&JsValue::undefined(), &[request_value], context)
-        .map_err(|error| format!("handler threw: {error}"))?;
-
-    interpret_return(&result, context)
+    let value = match handler.call(&JsValue::undefined(), &[request_value], context) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = inbound.reply.send(Err(format!("handler threw: {error}")));
+            return;
+        }
+    };
+    // 同步 Response：立即回线。
+    if let Some(spec) = response::response_to_spec(&value, context) {
+        let _ = inbound.reply.send(Ok(spec));
+        return;
+    }
+    // 异步：返回 Promise → 挂起表，落定后由 poll_pending_server 回线。
+    if let Some(object) = value.as_object()
+        && let Ok(promise) = JsPromise::from_object(object.clone())
+    {
+        PENDING_SERVER.with(|list| {
+            list.borrow_mut().push(PendingServer {
+                reply: inbound.reply,
+                promise,
+            })
+        });
+        return;
+    }
+    let _ = inbound.reply.send(Err(
+        "serve handler must return a Response (or a Promise resolving to one)".to_owned(),
+    ));
 }
 
-/// 把 handler 返回值解释为响应：本实现 `Response` → 抽出 spec；thenable → 异步未支持；其余 → 报错。
-fn interpret_return(value: &JsValue, context: &mut Context) -> Result<ResponseSpec, String> {
-    if let Some(spec) = response::response_to_spec(value, context) {
-        return Ok(spec);
-    }
-    if is_thenable(value, context) {
-        return Err(
-            "await  inside serve handler is not yet supported; return a Response synchronously"
-                .to_owned(),
-        );
-    }
-    Err("serve handler must return a Response".to_owned())
+/// 扫描挂起表：已落定的异步 handler 据其结果回线，未落定者留待下一轮。
+///
+/// 应在每轮 `run_jobs` 之后调用，使 `await fetch`/`await setTimeout` 完成的 Promise 能被兑现。
+pub(super) fn poll_pending_server(context: &mut Context) {
+    PENDING_SERVER.with(|list| {
+        let mut list = list.borrow_mut();
+        let mut index = 0;
+        while index < list.len() {
+            match list[index].promise.state() {
+                boa_engine::builtins::promise::PromiseState::Pending => index += 1,
+                boa_engine::builtins::promise::PromiseState::Fulfilled(value) => {
+                    let outcome = match response::response_to_spec(&value, context) {
+                        Some(spec) => Ok(spec),
+                        None => Err("handler resolved to a non-Response".to_owned()),
+                    };
+                    let _ = list[index].reply.send(outcome);
+                    list.remove(index);
+                }
+                boa_engine::builtins::promise::PromiseState::Rejected(reason) => {
+                    let message = JsError::from_opaque(reason).to_string();
+                    let _ = list[index]
+                        .reply
+                        .send(Err(format!("handler rejected: {message}")));
+                    list.remove(index);
+                }
+            }
+        }
+    });
 }
 
-/// 粗略判定 thenable：对象上 `then` 是函数即视为 Promise。
-fn is_thenable(value: &JsValue, context: &mut Context) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    object
-        .get(js_string!("then"), context)
-        .map(|then| then.as_function().is_some())
-        .unwrap_or(false)
+/// 预算耗尽：给所有挂起的异步 handler 回一个 500，令服务端线程关掉连接而非无限阻塞。
+pub(super) fn abandon_pending() {
+    for entry in PENDING_SERVER.with(|list| std::mem::take(&mut *list.borrow_mut())) {
+        let _ = entry.reply.send(Err("serve handler timed out".to_owned()));
+    }
 }
 
 /// 从解析出的请求构造标准形态的 `Request`（v1：method / url / headers）。
 ///
-/// 体不进 `Request`（规范要求经异步 `body`/`text()` 读取，异步 handler 支持后才提供）；
-/// 同步 handler 用 `method`/`url`/`headers` 即可应答。
+/// `url` 按 WHATWG 为绝对式；体不进 `Request`（规范要求异步 `body`/`text()` 读取，另议）。
 fn build_request(request: &ParsedRequest, context: &mut Context) -> JsResult<JsValue> {
     let head = &request.head;
     let host = head.header("host").unwrap_or("localhost");
