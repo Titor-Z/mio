@@ -96,6 +96,33 @@ fn spawn_mock_server() -> u16 {
                     String::from("content-type: application/json\r\n"),
                 ),
                 "/missing" => ("404 Not Found", String::from("nope"), String::new()),
+                // 重定向链：302 → /hello；303 → /echo（验证 POST 降为 GET）；
+                // 自环用于验证跳数上限；`http://` 无主机用于验证无效 Location。
+                "/redirect" => (
+                    "302 Found",
+                    String::new(),
+                    String::from("location: /hello\r\n"),
+                ),
+                "/redirect-chain" => (
+                    "302 Found",
+                    String::new(),
+                    String::from("location: /redirect\r\n"),
+                ),
+                "/redirect-303" => (
+                    "303 See Other",
+                    String::new(),
+                    String::from("location: /echo\r\n"),
+                ),
+                "/redirect-loop" => (
+                    "302 Found",
+                    String::new(),
+                    String::from("location: /redirect-loop\r\n"),
+                ),
+                "/redirect-bad" => (
+                    "302 Found",
+                    String::new(),
+                    String::from("location: http://\r\n"),
+                ),
                 // 回显方法、请求体与 x-test 头；值均为可控 ASCII，无需 JSON 转义。
                 // 原样回显请求头与请求体：multipart 等含控制字符的内容走 text/plain 直传。
                 "/raw" => (
@@ -593,6 +620,105 @@ fn fetch_error_status_is_not_rejection() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "404 不是拒绝：{output:?}");
     assert_eq!(stdout.trim(), "404 false nope");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_follows_redirect_chain_to_final_url() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-redirect");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const r = await fetch('http://127.0.0.1:{port}/redirect-chain');\n\
+             console.log(r.status, r.url.endsWith('/hello'), await r.text());\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "重定向跟随应成功退出：{output:?}");
+    // /redirect-chain → /redirect → /hello，两跳后落在 /hello，拿到 200 体。
+    assert_eq!(stdout.trim(), "200 true hello mio");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_post_303_becomes_get_on_redirect() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-redirect-303");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const r = await fetch('http://127.0.0.1:{port}/redirect-303', {{ method: 'POST', body: 'x' }});\n\
+             const data = await r.json();\n\
+             console.log('method', data.method);\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "303 用例应成功退出：{output:?}");
+    // 303 把 POST 降为 GET，跳到的 /echo 回显 method=GET。
+    assert_eq!(stdout.trim(), "method GET");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_redirect_loop_rejects_at_max_count() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-redirect-loop");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "try {{\n\
+             \x20   await fetch('http://127.0.0.1:{port}/redirect-loop');\n\
+             \x20   console.log('NOT_REJECTED');\n\
+             }} catch (e) {{\n\
+             \x20   console.log('rejected', String(e).includes('redirect'));\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "捕获后应正常退出：{output:?}");
+    assert_eq!(stdout.trim(), "rejected true");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_invalid_redirect_location_rejects() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-redirect-bad");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "try {{\n\
+             \x20   await fetch('http://127.0.0.1:{port}/redirect-bad');\n\
+             \x20   console.log('NOT_REJECTED');\n\
+             }} catch (e) {{\n\
+             \x20   console.log('rejected', e instanceof TypeError);\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "捕获后应正常退出：{output:?}");
+    assert_eq!(stdout.trim(), "rejected true");
 
     std::fs::remove_dir_all(&dir).ok();
 }

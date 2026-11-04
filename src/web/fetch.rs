@@ -7,6 +7,8 @@
 //!
 //! 当前范围：任意 method + 请求头 + 字节 body；4xx/5xx 是**成功结果**
 //! （fetch 语义只在网络/协议层失败时才 reject）。
+//! `3xx` 按 WHATWG 默认 `follow` 模式自动跟随（上限 20 跳，每一跳新开一条连接）；
+//! `redirect: 'manual' / 'error'` 暂不支持。
 //! 仅支持 `http`：本层不含 TLS，`https` 及其它协议一律归一为网络层失败。
 //! 取消不在本层：引擎层对已登记的挂起 Promise 立即拒绝，工作线程读完即丢弃结果。
 //!
@@ -54,7 +56,7 @@ impl FetchRequest {
 /// HTTP 响应快照：状态、合并后的头、已完整读入内存的 body。
 #[derive(Debug, Clone)]
 pub struct ResponseData {
-    /// 发起请求的 URL（重定向后语义暂不区分，等于入参）。
+    /// 最终 URL：跟随重定向后的落地地址（无重定向时等于入参），对应 `Response.url`。
     pub url: String,
     /// 响应状态码。
     pub status: u16,
@@ -92,31 +94,117 @@ impl ResponseData {
     }
 }
 
-/// 执行一次请求：解析 URL、建连、发送 [`http::serialize_request`] 的报文、
-/// 用 `reactor` 的非阻塞读驱动 [`http::ResponseParser`] 直到响应完整。
-///
-/// 不抛出：一切失败（非法 URL、非 http、DNS、连接、协议、截断）都归一为
-/// [`FetchOutcome`] 的 `Err` 消息，由引擎层包装成 `TypeError` 拒绝 Promise。
-pub fn fetch_execute(request: &FetchRequest) -> FetchOutcome {
-    let (addr, authority, path) = split_target(&request.url)?;
-    let wire = http::serialize_request(
-        &request.method,
-        &path,
-        &authority,
-        &request.headers,
-        request.body.as_deref(),
-    );
-    let body_forbidden = request.method == "HEAD";
+/// 默认重定向上限（与 WHATWG fetch / 浏览器一致的 20 跳）。
+const MAX_REDIRECTS: usize = 20;
 
-    let parsed = roundtrip(addr, &wire, body_forbidden)?;
-    let head = parsed.head;
-    Ok(ResponseData {
-        url: request.url.clone(),
-        status: head.status,
-        status_text: head.status_text,
-        headers: head.headers,
-        body: parsed.body,
-    })
+/// 执行一次请求：解析 URL、建连、发送 [`http::serialize_request`] 的报文、
+/// 用 `reactor` 的非阻塞读驱动 [`http::ResponseParser`] 直到响应完整；
+/// 若响应是需跟随的重定向（301/302/303/307/308 + `Location`），以最终 URL 为准
+/// 重新发起，直至终态响应或达到 [`MAX_REDIRECTS`]。
+///
+/// 不抛出：一切失败（非法 URL、非 http、DNS、连接、协议、截断、无效 Location、
+/// 重定向成环）都归一为 [`FetchOutcome`] 的 `Err` 消息，由引擎层包装成 `TypeError` 拒绝 Promise。
+pub fn fetch_execute(request: &FetchRequest) -> FetchOutcome {
+    let mut url = request.url.clone();
+    let mut method = request.method.clone();
+    let mut headers = request.headers.clone();
+    let mut body = request.body.clone();
+
+    // 首个请求不计入跳数：循环至多 MAX_REDIRECTS 次重定向（共 MAX_REDIRECTS+1 个请求）。
+    for _ in 0..=MAX_REDIRECTS {
+        let (addr, authority, path) = split_target(&url)?;
+        let wire = http::serialize_request(&method, &path, &authority, &headers, body.as_deref());
+        let parsed = roundtrip(addr, &wire, method == "HEAD")?;
+        let head = parsed.head;
+
+        match redirect_plan(&url, &method, head.status, &head.headers) {
+            Redirect::None => {
+                return Ok(ResponseData {
+                    url,
+                    status: head.status,
+                    status_text: head.status_text,
+                    headers: head.headers,
+                    body: parsed.body,
+                });
+            }
+            Redirect::Follow { target, to_get } => {
+                if to_get {
+                    // 301/302/303 把非 GET/HEAD 降级为 GET：清空 body，丢弃与请求体绑定的头，
+                    // 避免陈旧的 content-type/length 跟随到新请求。
+                    method = String::from("GET");
+                    body = None;
+                    strip_entity_headers(&mut headers);
+                }
+                url = target;
+            }
+            Redirect::Error(message) => return Err(message),
+        }
+    }
+
+    Err(format!(
+        "fetch failed: maximum redirect count ({MAX_REDIRECTS}) exceeded"
+    ))
+}
+
+/// 一条重定向的判定结果。
+enum Redirect {
+    /// 不是需要跟随的重定向（非 3xx、或 3xx 无 `Location`）：原样返回该响应。
+    None,
+    /// 跟随到 `target`；`to_get` 表示需把方法降级为 GET 并丢弃 body。
+    Follow { target: String, to_get: bool },
+    /// 不可跟随（`Location` 无法解析）：作为网络层失败 reject。
+    Error(String),
+}
+
+/// 按 WHATWG fetch 判定一个响应是否应跟随，以及跟随后的方法变化。
+///
+/// 仅 `301/302/303/307/308` 且带 `Location` 才跟随；缺 `Location` 视为终态响应
+/// （返回 [`Redirect::None`]）。`Location` 以当前 URL 为基准解析（允许相对）；
+/// 解析失败为网络错误。`301/302/303` 把非 GET/HEAD 降级为 GET；`307/308` 原样保留方法与 body。
+fn redirect_plan(
+    current: &str,
+    method: &str,
+    status: u16,
+    headers: &[(String, String)],
+) -> Redirect {
+    if !matches!(status, 301..=303 | 307 | 308) {
+        return Redirect::None;
+    }
+    let Some((_, location)) = headers.iter().find(|(name, _)| name == "location") else {
+        return Redirect::None;
+    };
+    let Ok(base) = Url::parse(current) else {
+        // current 在发起前已由 split_target 校验为合法 URL；此处仅为防御，回落终态。
+        return Redirect::None;
+    };
+    let mut target = match base.join(location) {
+        Ok(url) => url,
+        Err(_) => {
+            return Redirect::Error(format!(
+                "fetch failed: invalid redirect location: {location}"
+            ));
+        }
+    };
+    // WHATWG：`Location` 未显式带片段时，继承当前 URL 的片段。
+    if !location.contains('#') {
+        target.set_fragment(base.fragment());
+    }
+
+    let to_get = matches!(status, 301..=303) && method != "GET" && method != "HEAD";
+    Redirect::Follow {
+        target: target.into(),
+        to_get,
+    }
+}
+
+/// 方法降级为 GET 时，丢弃与请求体绑定的头。
+fn strip_entity_headers(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(name, _)| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "content-length" | "content-type" | "transfer-encoding"
+        )
+    });
 }
 
 /// 把 URL 拆成（对端地址, Host 头值, origin-form 请求路径）。
@@ -276,6 +364,108 @@ mod tests {
         assert_eq!(request.method, "GET");
         assert!(request.headers.is_empty());
         assert!(request.body.is_none());
+    }
+
+    fn loc(headers: &[(&str, &str)]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn redirect_resolves_relative_location() {
+        let plan = redirect_plan(
+            "http://h:8080/a/b?x=1",
+            "GET",
+            302,
+            &loc(&[("location", "/final")]),
+        );
+        match plan {
+            Redirect::Follow { target, to_get } => {
+                assert_eq!(target, "http://h:8080/final");
+                assert!(!to_get, "GET 无需降级");
+            }
+            _ => panic!("302 带 Location 应跟随"),
+        }
+    }
+
+    #[test]
+    fn redirect_303_downgrades_post_to_get() {
+        let plan = redirect_plan(
+            "http://h/submit",
+            "POST",
+            303,
+            &loc(&[("location", "/result")]),
+        );
+        match plan {
+            Redirect::Follow { target, to_get } => {
+                assert!(to_get, "303 把 POST 降为 GET");
+                assert_eq!(target, "http://h/result");
+            }
+            _ => panic!("应跟随"),
+        }
+    }
+
+    #[test]
+    fn redirect_308_preserves_method_and_body() {
+        let plan = redirect_plan("http://h/a", "POST", 308, &loc(&[("location", "/b")]));
+        match plan {
+            Redirect::Follow { to_get, .. } => assert!(!to_get, "308 保留方法与 body"),
+            _ => panic!("应跟随"),
+        }
+    }
+
+    #[test]
+    fn redirect_without_location_is_terminal() {
+        // 缺 Location 的 301 是终态响应，不跟随也不报错。
+        assert!(matches!(
+            redirect_plan("http://h/a", "GET", 301, &loc(&[])),
+            Redirect::None
+        ));
+    }
+
+    #[test]
+    fn non_redirect_status_is_not_followed() {
+        assert!(matches!(
+            redirect_plan("http://h/a", "GET", 200, &loc(&[("location", "/b")])),
+            Redirect::None
+        ));
+    }
+
+    #[test]
+    fn unparseable_location_is_error() {
+        // `http://` 无主机 → join 失败 → 网络层错误。
+        assert!(matches!(
+            redirect_plan("http://h/a", "GET", 302, &loc(&[("location", "http://")])),
+            Redirect::Error(_)
+        ));
+    }
+
+    #[test]
+    fn redirect_inherits_current_fragment_when_location_has_none() {
+        let plan = redirect_plan(
+            "http://h/a#section",
+            "GET",
+            302,
+            &loc(&[("location", "/b")]),
+        );
+        match plan {
+            Redirect::Follow { target, .. } => assert_eq!(target, "http://h/b#section"),
+            _ => panic!("应跟随"),
+        }
+    }
+
+    #[test]
+    fn strip_entity_headers_drops_body_bound_headers() {
+        let mut headers = loc(&[
+            ("content-type", "application/json"),
+            ("content-length", "12"),
+            ("x-test", "keep"),
+        ]);
+        strip_entity_headers(&mut headers);
+        let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["x-test"]);
     }
 }
 
