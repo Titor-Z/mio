@@ -695,14 +695,15 @@ fn decide_request_framing(head: &RequestHead) -> RequestState {
 
 /// 序列化响应报文：状态行 + 头 + 空行 + 体（服务端侧）。
 ///
-/// M1 不做连接复用与分块回应：除非调用方自己给了 `content-length` / `connection`，
-/// 否则补 `content-length` 与 `connection: close`。204/304/1xx 不得带体，不写长度也不附体。
+/// `close_connection` 决定缺省 `Connection` 值（调用方自己给了 `connection` 头时以用户值为准）：
+/// `true` → `connection: close`，`false` → `connection: keep-alive`。204/304/1xx 不得带体，不写长度也不附体。
 #[must_use]
 pub fn serialize_response(
     status: u16,
     status_text: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
+    close_connection: bool,
 ) -> Vec<u8> {
     let body_allowed = !(status == 204 || status == 304 || (100..200).contains(&status));
     let mut wire = if status_text.is_empty() {
@@ -729,7 +730,11 @@ pub fn serialize_response(
         wire.push_str(&format!("content-length: {}\r\n", body_bytes.len()));
     }
     if !gave_connection {
-        wire.push_str("connection: close\r\n");
+        wire.push_str(if close_connection {
+            "connection: close\r\n"
+        } else {
+            "connection: keep-alive\r\n"
+        });
     }
     wire.push_str("\r\n");
     let mut message = wire.into_bytes();
@@ -1027,21 +1032,40 @@ mod tests {
                 (String::from("connection"), String::from("keep-alive")),
             ],
             Some(b"hi"),
+            true,
         ))
         .unwrap();
         assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
         assert!(wire.contains("content-type: text/plain\r\n"));
         assert!(wire.contains("content-length: 2\r\n"));
-        // 用户给的 connection 优先，不补 close。
+        // 用户给的 connection 优先，close 标志被覆盖。
         assert!(wire.contains("connection: keep-alive\r\n"));
         assert!(!wire.contains("connection: close"));
         assert!(wire.ends_with("\r\n\r\nhi"));
     }
 
     #[test]
+    fn serialized_response_close_flag_picks_connection_value() {
+        let closed = String::from_utf8(serialize_response(200, "OK", &[], None, true)).unwrap();
+        assert!(closed.contains("connection: close\r\n"), "{closed}");
+        assert!(
+            closed.contains("content-length: 0\r\n"),
+            "空体应声明长度为 0：{closed}"
+        );
+        let held = String::from_utf8(serialize_response(200, "OK", &[], None, false)).unwrap();
+        assert!(held.contains("connection: keep-alive\r\n"), "{held}");
+    }
+
+    #[test]
     fn no_content_response_has_neither_length_nor_body() {
-        let wire = String::from_utf8(serialize_response(204, "No Content", &[], Some(b"ignored")))
-            .unwrap();
+        let wire = String::from_utf8(serialize_response(
+            204,
+            "No Content",
+            &[],
+            Some(b"ignored"),
+            false,
+        ))
+        .unwrap();
         assert!(wire.starts_with("HTTP/1.1 204 No Content\r\n"), "{wire}");
         assert!(!wire.contains("content-length"), "204 不得声明长度");
         assert!(!wire.contains("ignored"), "204 不得附体");

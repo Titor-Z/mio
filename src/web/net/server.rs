@@ -4,13 +4,19 @@
 //! [`http::ParsedRequest`] 与 [`ResponseSpec`]，处理器以闭包注入。引擎绑定层把 JS 的
 //! `serve()` handler 适配成这个闭包，并把跨线程往返桥接过来。
 //!
-//! M1 范围：每连接一个线程并发处理（accept 后立即移交），每连接读完一个请求即
-//! 应答并关闭（`connection: close`）。连接复用（keep-alive）与流式 body 是后续项。
+//! M1 范围：每连接一个线程并发处理（accept 后立即移交），并支持 keep-alive（同一
+//! 连接顺序处理多个请求，直到对端关闭 / 空闲超时 / 某响应带 `connection: close`）。
+//! 流式 body（ReadableStream）与分块回应仍是后续项。
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::time::Duration;
 
 use super::http::{self, Progress, RequestParser};
+
+/// keep-alive 空闲读超时：一条连接处理完一个请求后等下一个，至多这么久，
+/// 到点即静默关闭，不无限占用连接线程（慢客户端 / 半开连接的兜底）。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 服务端要写出的响应：状态、原因短语、头、体。引擎层从 JS `Response` 拆成此纯数据。
 #[derive(Debug, Clone)]
@@ -41,12 +47,13 @@ impl ResponseSpec {
     }
 }
 
-/// 在一条双向连接上读一个请求、交给 `handler`、写出响应。
+/// 在一条双向连接上循环处理请求：读一个、交给 `handler`、写出响应，直至对端关闭、
+/// 超时、或某个响应声明 `connection: close`。
 ///
-/// 泛型于 `S: Read + Write`：真实 [`std::net::TcpStream`] 与内存流都能喂。读用阻塞
-/// `read`（服务端线程上，语义与 `web::fetch` 的阻塞连接一致）；解析逻辑全落在
-/// [`RequestParser`]，本函数只负责「何时再给一批字节、何时写出」。协议错误转成
-/// [`io::ErrorKind::InvalidData`]。
+/// 泛型于 `S: Read + Write`：真实 [`std::net::TcpStream`] 与内存流都能喂。读超时（由
+/// [`serve_loop`] 给 TcpStream 设置）到期时返回 [`io::ErrorKind::WouldBlock`] /
+/// [`io::ErrorKind::TimedOut`]，本函数据此静默收尾。keep-alive 的封帧完全由请求头
+/// `Connection` 与版本决定（见 [`request_keep_alive`]）。协议错误转成 [`io::ErrorKind::InvalidData`]。
 pub fn handle_connection<S>(
     mut stream: S,
     handler: &mut dyn FnMut(&http::ParsedRequest) -> ResponseSpec,
@@ -54,43 +61,87 @@ pub fn handle_connection<S>(
 where
     S: Read + Write,
 {
-    let mut parser = RequestParser::new();
     let mut buffer = [0u8; 8 * 1024];
     loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                // 客户端提前关闭：请求若不完整，解析器按截断报错；完整则正常收尾。
-                parser.end_of_input().map_err(invalid)?;
-                break;
+        // 每个请求一个全新的解析器：上一请求的字节已全部消费（解析器边收边丢）。
+        let mut parser = RequestParser::new();
+        let mut fed_any = false;
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    // 请求间隙对端关闭 → 正常收尾；半路 EOF → 截断错误。
+                    if !fed_any {
+                        return Ok(());
+                    }
+                    parser.end_of_input().map_err(invalid)?;
+                    return Ok(());
+                }
+                Ok(read) => match parser.feed(&buffer[..read]).map_err(invalid)? {
+                    Progress::Complete => break,
+                    Progress::NeedMore => fed_any = true,
+                },
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // 空闲/慢客户端超时：静默关闭该连接。
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             }
-            Ok(read) => match parser.feed(&buffer[..read]).map_err(invalid)? {
-                Progress::Complete => break,
-                Progress::NeedMore => {}
-            },
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
+        }
+
+        let request = parser.into_request().map_err(invalid)?;
+        let keep_alive = request_keep_alive(&request);
+        let response = handler(&request);
+        let wire = http::serialize_response(
+            response.status,
+            &response.status_text,
+            &response.headers,
+            Some(&response.body),
+            !keep_alive,
+        );
+        stream.write_all(&wire)?;
+        stream.flush()?;
+        if !keep_alive {
+            return Ok(());
         }
     }
+}
 
-    let request = parser.into_request().map_err(invalid)?;
-    let response = handler(&request);
-    let wire = http::serialize_response(
-        response.status,
-        &response.status_text,
-        &response.headers,
-        Some(&response.body),
-    );
-    stream.write_all(&wire)?;
-    stream.flush()?;
-    Ok(())
+/// 按请求判定本连接是否应保持：`Connection` 头优先，否则 HTTP/1.1 默认持久、1.0 默认关。
+fn request_keep_alive(request: &http::ParsedRequest) -> bool {
+    let connection = request
+        .head
+        .header("connection")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut tokens = connection.split(',').map(|token| token.trim());
+    if tokens.any(|token| token == "close") {
+        return false;
+    }
+    if request
+        .head
+        .header("connection")
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .split(',')
+        .any(|token| token.trim() == "keep-alive")
+    {
+        return true;
+    }
+    // 无显式指令：仅 HTTP/1.1 默认持久。
+    request.head.version == "HTTP/1.1"
 }
 
 /// 绑定地址并进入 accept 循环，每连接开一个线程交给 `handler`。
 ///
 /// 返回监听端口（供调用方/测试得知实际端口，绑定 0 时尤其有用）。accept 后立即
-/// 移交连接线程、主循环回到 accept，故多个连接并发在途。`handler` 需 `Clone + Send +
-/// 'static`以便逐连接各拥一份；单连接出错只影响该线程，不波及其他。keep-alive（一
-/// 连接多请求）尚未实现：每连接处理一个请求即关。
+/// 移交连接线程、主循环回到 accept，故多个连接并发在途；连接线程上设空闲读超时。
+/// `handler` 需 `Clone + Send + 'static` 以便逐连接各拥一份。
 pub fn serve_loop<F>(addr: SocketAddr, handler: F) -> io::Result<u16>
 where
     F: Fn(&http::ParsedRequest) -> ResponseSpec + Send + Clone + 'static,
@@ -99,6 +150,8 @@ where
     let port = listener.local_addr()?.port();
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // 空闲超时只在真实 socket 上设；handle_connection 对 WouldBlock/TimedOut 静默收尾。
+        let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
         let mut handler = handler.clone();
         std::thread::spawn(move || {
             let _ = handle_connection(stream, &mut handler);
@@ -139,7 +192,7 @@ mod tests {
 
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("连接");
         client
-            .write_all(b"GET /health?q=1 HTTP/1.1\r\nhost: x\r\n\r\n")
+            .write_all(b"GET /health?q=1 HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
             .unwrap();
 
         let mut response = String::new();

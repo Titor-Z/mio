@@ -1357,14 +1357,9 @@ fn serve_responds_to_real_http_request() {
     };
 
     client
-        .write_all(
-            b"GET /ping HTTP/1.1
-host: x
-
-",
-        )
+        .write_all(b"GET /ping HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
         .unwrap();
-    // 服务端每连接一请求即 `connection: close`，read_to_string 拿到完整响应后 EOF。
+    // 显式 connection: close：服务端应答后立即关连接，read_to_string 拿到完整响应后 EOF。
     let mut response = String::new();
     client.read_to_string(&mut response).unwrap();
 
@@ -1429,7 +1424,7 @@ fn serve_async_handler_awaits_fetch() {
     };
 
     client
-        .write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n")
+        .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
         .unwrap();
     let mut response = String::new();
     client.read_to_string(&mut response).unwrap();
@@ -1489,7 +1484,7 @@ fn serve_handler_reads_request_body() {
 
     let payload = r#"{"name":"ada","n":7}"#;
     let request = format!(
-        "POST /submit HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+        "POST /submit HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
         payload.len()
     );
     client.write_all(request.as_bytes()).unwrap();
@@ -1560,7 +1555,8 @@ serve(async (req) => {{
         for _ in 0..2 {
             handles.push(scope.spawn(|| {
                 let mut c = TcpStream::connect(("127.0.0.1", port)).expect("连接");
-                c.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
+                c.write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+                    .unwrap();
                 let mut s = String::new();
                 c.read_to_string(&mut s).unwrap();
                 s
@@ -1582,6 +1578,99 @@ serve(async (req) => {{
         bodies.iter().any(|b| b.ends_with("peak=2")),
         "两条连接应并发在途（peak 应达 2）：{bodies:?}"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 从 keep-alive 连接上读**一个**完整响应（按 content-length 定体），返回原始字节串。
+fn read_one_response(stream: &mut TcpStream) -> String {
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                raw.push(byte[0]);
+                if raw.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let headers = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+    let length = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    if length > 0 {
+        stream.read_exact(&mut body).expect("读完声明的体");
+    }
+    raw.extend_from_slice(&body);
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+#[test]
+fn serve_reuses_connection_for_multiple_requests() {
+    // keep-alive：同一条连接上连发两个请求，靠模块作用域计数器证明连接未被关。
+    let port: u16 = 18104;
+    let dir = unique_dir("serve-keepalive");
+    let file = dir.join("server.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "let hits = 0;
+serve((req) => {{
+  hits += 1;
+  const {{ pathname }} = new URL(req.url);
+  return new Response('hit ' + hits + ' ' + pathname);
+}}, {{ port: {port} }});
+",
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(mio_binary())
+        .args(["run", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("启动 mio 服务器进程");
+
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let out = child.wait_with_output().expect("回收");
+            panic!(
+                "serve 进程提前退出（{status}）：stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).expect("连接");
+    // 不发 connection: close → HTTP/1.1 默认持久，连接应跨两个请求存活。
+    client
+        .write_all(b"GET /a HTTP/1.1\r\nhost: x\r\n\r\n")
+        .unwrap();
+    let first = read_one_response(&mut client);
+    client
+        .write_all(b"GET /b HTTP/1.1\r\nhost: x\r\n\r\n")
+        .unwrap();
+    let second = read_one_response(&mut client);
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert!(first.ends_with("hit 1 /a"), "首响应：{first}");
+    assert!(second.ends_with("hit 2 /b"), "次响应（同连接）：{second}");
 
     std::fs::remove_dir_all(&dir).ok();
 }
