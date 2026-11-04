@@ -18,8 +18,11 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs};
+use std::sync::{Arc, OnceLock};
 
 use reactor::{Events, Interest, Poll, Token, net::TcpStream};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use url::Url;
 
 use crate::web::net::http::{self, Progress};
@@ -112,9 +115,9 @@ pub fn fetch_execute(request: &FetchRequest) -> FetchOutcome {
 
     // 首个请求不计入跳数：循环至多 MAX_REDIRECTS 次重定向（共 MAX_REDIRECTS+1 个请求）。
     for _ in 0..=MAX_REDIRECTS {
-        let (addr, authority, path) = split_target(&url)?;
+        let (addr, host, authority, path, is_tls) = split_target(&url)?;
         let wire = http::serialize_request(&method, &path, &authority, &headers, body.as_deref());
-        let parsed = roundtrip(addr, &wire, method == "HEAD")?;
+        let parsed = roundtrip(addr, &host, &wire, method == "HEAD", is_tls)?;
         let head = parsed.head;
 
         match redirect_plan(&url, &method, head.status, &head.headers) {
@@ -207,19 +210,22 @@ fn strip_entity_headers(headers: &mut Vec<(String, String)>) {
     });
 }
 
-/// 把 URL 拆成（对端地址, Host 头值, origin-form 请求路径）。
+/// 把 URL 拆成（对端地址, SNI 主机名, Host 头值, origin-form 请求路径, 是否 TLS）。
 ///
-/// 非 `http` 方案在此拒绝；DNS 解析在本工作线程上同步进行（已在引擎线程之外，
-/// 阻塞不影响宿主事件循环），仅取第一个解析结果。
-fn split_target(raw: &str) -> Result<(SocketAddr, String, String), String> {
+/// 接受 `http` / `https`；其它方案拒绝。DNS 解析在本工作线程上同步进行（已在引擎
+/// 线程之外，阻塞不影响宿主事件循环），仅取第一个解析结果。
+fn split_target(raw: &str) -> Result<(SocketAddr, String, String, String, bool), String> {
     let parsed = Url::parse(raw).map_err(|error| format!("fetch failed: invalid URL: {error}"))?;
-    if parsed.scheme() != "http" {
-        // 本层无 TLS：https 与其它协议一律视为网络层失败（fetch reject）。
-        return Err(format!(
-            "fetch failed: unsupported scheme {:?} (only http is available)",
-            parsed.scheme()
-        ));
-    }
+    let scheme = parsed.scheme();
+    let is_tls = match scheme {
+        "http" => false,
+        "https" => true,
+        other => {
+            return Err(format!(
+                "fetch failed: unsupported scheme {other:?} (only http/https)"
+            ));
+        }
+    };
     let host = parsed
         .host_str()
         .ok_or_else(|| "fetch failed: URL has no host".to_owned())?;
@@ -227,9 +233,10 @@ fn split_target(raw: &str) -> Result<(SocketAddr, String, String), String> {
         .port_or_known_default()
         .ok_or_else(|| "fetch failed: URL has no port".to_owned())?;
 
-    // Host 头仅在显式端口（非默认 80）时携带端口，符合 RFC 9110 authority 形式。
+    // Host 头仅在显式端口（非该方案默认端口）时携带端口，符合 RFC 9110 authority 形式。
+    let default_port = if is_tls { 443 } else { 80 };
     let authority = match parsed.port() {
-        Some(explicit) if explicit != 80 => format!("{host}:{explicit}"),
+        Some(explicit) if explicit != default_port => format!("{host}:{explicit}"),
         _ => host.to_owned(),
     };
 
@@ -248,22 +255,25 @@ fn split_target(raw: &str) -> Result<(SocketAddr, String, String), String> {
         .next()
         .ok_or_else(|| format!("fetch failed: could not resolve {host}"))?;
 
-    Ok((addr, authority, path))
+    Ok((addr, host.to_owned(), authority, path, is_tls))
 }
 
-/// 单连接的请求-响应往返。
-///
-/// 连接与写出用阻塞的 `std::net::TcpStream`（本机/局域网瞬时完成，远端 SYN 挂起也由
-/// 宿主预算兜底），随后切到非阻塞并交给 `reactor::Poll` 驱动读：每次可读字节喂进解析器，
-/// 直到 [`Progress::Complete`] 或 EOF。这样报文封帧逻辑全部落在 [`http::ResponseParser`]，
-/// socket 层只负责「何时再给一批字节」。
+/// 单连接的请求-响应往返。明文走阻塞写 + `reactor::Poll` 非阻塞读；TLS 走阻塞
+/// `rustls::StreamOwned`（都在工作线程上，不阻宿主循环）。两者同一 `ResponseParser` 封帧。
 fn roundtrip(
     addr: SocketAddr,
+    host: &str,
     wire: &[u8],
     body_forbidden: bool,
+    is_tls: bool,
 ) -> Result<http::ParsedResponse, String> {
     let mut std_stream = StdTcpStream::connect(addr)
         .map_err(|error| format!("fetch failed: could not connect to {addr}: {error}"))?;
+
+    if is_tls {
+        return tls_roundtrip(std_stream, host, wire, body_forbidden);
+    }
+
     std_stream
         .write_all(wire)
         .map_err(|error| format!("fetch failed: could not send request: {error}"))?;
@@ -307,6 +317,67 @@ fn roundtrip(
     }
 
     parser.into_response()
+}
+
+/// 在已连上的 socket 上跑一次 TLS 往返：握手 + 写请求 + 喂 [`http::ResponseParser`] 直到完成/EOF。
+fn tls_roundtrip(
+    stream: StdTcpStream,
+    host: &str,
+    wire: &[u8],
+    body_forbidden: bool,
+) -> Result<http::ParsedResponse, String> {
+    let config = tls_client_config();
+    let server = ServerName::try_from(host.to_owned())
+        .map_err(|error| format!("fetch failed: invalid TLS host {host:?}: {error}"))?;
+    let connection = ClientConnection::new(config, server)
+        .map_err(|error| format!("fetch failed: TLS setup: {error}"))?;
+    let mut tls = StreamOwned::new(connection, stream);
+
+    tls.write_all(wire)
+        .map_err(|error| format!("fetch failed: could not send request: {error}"))?;
+    tls.flush()
+        .map_err(|error| format!("fetch failed: could not flush request: {error}"))?;
+
+    // 阻塞读（工作线程上）；rustls Stream 自己处理握手与记录拆包。
+    let mut parser = http::ResponseParser::new(body_forbidden);
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        match tls.read(&mut buffer) {
+            Ok(0) => {
+                parser.end_of_input()?;
+                break;
+            }
+            Ok(read) => match parser.feed(&buffer[..read])? {
+                Progress::Complete => break,
+                Progress::NeedMore => {}
+            },
+            Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!("fetch failed: TLS read error: {error}"));
+            }
+        }
+    }
+    parser.into_response()
+}
+
+/// 惰性构建并缓存一份 TLS 客户端配置（纯 Rust provider + 公网根证书 + TLS 1.2/1.3）。
+///
+/// `ClientConfig` 是 `Send + Sync`，用 [`OnceLock`] 全局建一次、多连接共享。
+fn tls_client_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config =
+                ClientConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
+                    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                    .expect("TLS 版本配置有效（1.2/1.3 均已启用）")
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+            Arc::new(config)
+        })
+        .clone()
 }
 
 #[cfg(test)]
@@ -356,6 +427,30 @@ mod tests {
     fn invalid_url_produces_err_without_network() {
         let outcome = fetch_execute(&FetchRequest::new(String::from("not-a-url")));
         assert!(outcome.is_err(), "非法 URL 必须走失败路径");
+    }
+
+    #[test]
+    fn split_target_accepts_https_and_flags_tls() {
+        let (addr, host, authority, path, is_tls) =
+            split_target("https://localhost/api?x=1").expect("https 应通过");
+        assert!(is_tls);
+        assert_eq!(host, "localhost");
+        assert_eq!(authority, "localhost", "默认 443 不进 authority");
+        assert_eq!(path, "/api?x=1");
+        assert_eq!(addr.port(), 443, "https 缺省端口应为 443");
+    }
+
+    #[test]
+    fn split_target_https_keeps_explicit_non_default_port_in_authority() {
+        let (_addr, _host, authority, _path, is_tls) =
+            split_target("https://localhost:8443/").expect("应通过");
+        assert!(is_tls);
+        assert_eq!(authority, "localhost:8443", "非默认端口应进 authority");
+    }
+
+    #[test]
+    fn split_target_rejects_non_http_schemes() {
+        assert!(split_target("ftp://localhost/").is_err());
     }
 
     #[test]

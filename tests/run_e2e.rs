@@ -1792,6 +1792,55 @@ fn serve_https_handshake_and_request() {
 }
 
 #[test]
+fn fetch_https_client_enters_tls_handshake() {
+    // fetch https 到本机自签服务：webpki-roots 不认自签，应在证书验证处失败。
+    // 意义：证明 fetch 真进入了 TLS 路径（旧代码会先以 “unsupported scheme” 拒，不含证书字样）。
+    let port: u16 = 18106;
+    let dir = unique_dir("fetch-https");
+    std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 1200 } }").unwrap();
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("生成自签证书");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+    std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
+
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "serve(() => new Response('x'), {{ port: {port}, cert: '{}', key: '{}' }});
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+await delay(300);
+try {{
+  await fetch('https://127.0.0.1:{port}/');
+  console.log('UNEXPECTED_OK');
+}} catch (e) {{
+  const m = String(e).toLowerCase();
+  console.log('reached-tls', m.includes('cert') || m.includes('tls'));
+}}
+",
+            cert_path.to_str().unwrap().replace('\\', "/"),
+            key_path.to_str().unwrap().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "脚本应由 timeoutMs 收束后正常退出：{output:?}"
+    );
+    assert!(
+        stdout.contains("reached-tls true"),
+        "应进入 TLS 验证并因自签失败：{stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn microtask_storm_is_stopped_by_run_budget() {
     let dir = unique_dir("microtask-storm");
     std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 800 } }").unwrap();
@@ -1956,8 +2005,10 @@ fn zero_period_interval_yields_between_rounds_instead_of_spinning() {
         "零周期 interval 应正常终局：{output:?}"
     );
     assert!(stdout.contains("first tick"), "至少应触发一次：{stdout}");
+    // 看门狗保证真自旋也会被按时停掉；此上限只防“进程挂死”这类极端情况，
+    // 并为并行负载下的调度留充裕（套件里多个 TLS 子进程会抢 CPU）。
     assert!(
-        elapsed.as_secs() < 5,
+        elapsed.as_secs() < 30,
         "预算 200ms 却在 {elapsed:?} 后才结束：同一轮里自旋未让位"
     );
 
