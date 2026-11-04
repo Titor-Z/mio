@@ -4,8 +4,8 @@
 //! [`http::ParsedRequest`] 与 [`ResponseSpec`]，处理器以闭包注入。引擎绑定层把 JS 的
 //! `serve()` handler 适配成这个闭包，并把跨线程往返桥接过来。
 //!
-//! M1 范围：串行处理连接（一次一个），每连接读完一个请求即应答并关闭（`connection: close`）。
-//! 连接复用（keep-alive）与并发是后续项——阻塞式单线程循环先把协议正确性跑通。
+//! M1 范围：每连接一个线程并发处理（accept 后立即移交），每连接读完一个请求即
+//! 应答并关闭（`connection: close`）。连接复用（keep-alive）与流式 body 是后续项。
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -85,20 +85,24 @@ where
     Ok(())
 }
 
-/// 绑定地址并进入串行 accept 循环，逐连接交给 `handler`。
+/// 绑定地址并进入 accept 循环，每连接开一个线程交给 `handler`。
 ///
-/// 返回监听端口（供调用方/测试得知实际端口，绑定 0 时尤其有用）。循环阻塞至
-/// `listener.incoming()` 结束；进程退出即回收。
-pub fn serve_loop(
-    addr: SocketAddr,
-    mut handler: impl FnMut(&http::ParsedRequest) -> ResponseSpec,
-) -> io::Result<u16> {
+/// 返回监听端口（供调用方/测试得知实际端口，绑定 0 时尤其有用）。accept 后立即
+/// 移交连接线程、主循环回到 accept，故多个连接并发在途。`handler` 需 `Clone + Send +
+/// 'static`以便逐连接各拥一份；单连接出错只影响该线程，不波及其他。keep-alive（一
+/// 连接多请求）尚未实现：每连接处理一个请求即关。
+pub fn serve_loop<F>(addr: SocketAddr, handler: F) -> io::Result<u16>
+where
+    F: Fn(&http::ParsedRequest) -> ResponseSpec + Send + Clone + 'static,
+{
     let listener = TcpListener::bind(addr)?;
     let port = listener.local_addr()?.port();
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        // 单连接出错不影响后续 accept：吞掉继续。
-        let _ = handle_connection(stream, &mut handler);
+        let mut handler = handler.clone();
+        std::thread::spawn(move || {
+            let _ = handle_connection(stream, &mut handler);
+        });
     }
     Ok(port)
 }

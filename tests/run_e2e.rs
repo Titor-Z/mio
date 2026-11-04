@@ -1509,6 +1509,84 @@ fn serve_handler_reads_request_body() {
 }
 
 #[test]
+fn serve_handles_concurrent_connections() {
+    // 共享在途计数器：只有两条连接在被任一条完成前都被派发给引擎，peak 才能到 2。
+    let port: u16 = 18103;
+    let dir = unique_dir("serve-conc");
+    let file = dir.join("server.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "let inflight = 0;
+let peak = 0;
+const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+serve(async (req) => {{
+  inflight += 1;
+  if (inflight > peak) peak = inflight;
+  await wait(80);
+  inflight -= 1;
+  return new Response('peak=' + peak);
+}}, {{ port: {port} }});
+",
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(mio_binary())
+        .args(["run", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("启动 mio 服务器进程");
+
+    // 先探到端口就绪（探测连接立即关闭，不发请求）。
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let out = child.wait_with_output().expect("回收");
+            panic!(
+                "serve 进程提前退出（{status}）：stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    // 两个客户端并发发请求，各自读到完整响应。
+    let bodies = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            handles.push(scope.spawn(|| {
+                let mut c = TcpStream::connect(("127.0.0.1", port)).expect("连接");
+                c.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
+                let mut s = String::new();
+                c.read_to_string(&mut s).unwrap();
+                s
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("客户端线程"))
+            .collect::<Vec<_>>()
+    });
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    for body in &bodies {
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    }
+    assert!(
+        bodies.iter().any(|b| b.ends_with("peak=2")),
+        "两条连接应并发在途（peak 应达 2）：{bodies:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn microtask_storm_is_stopped_by_run_budget() {
     let dir = unique_dir("microtask-storm");
     std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 800 } }").unwrap();
