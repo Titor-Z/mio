@@ -309,17 +309,33 @@ fn parse_head_block(block: &[u8]) -> Result<ResponseHead, String> {
     let status_text = parts.next().unwrap_or("").to_owned();
 
     // 同名头合并成组合值，顺序按首次出现；obs-fold（空白开头的续行）并入上一条。
+    let headers = collect_headers(lines)?;
+
+    Ok(ResponseHead {
+        status,
+        status_text,
+        headers,
+    })
+}
+
+/// 合并头行为（同名逗号拼接 + obs-fold 续行并入上一条），请求与响应共用。
+fn collect_headers<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> Result<Vec<(String, String)>, String> {
     let mut headers: Vec<(String, String)> = Vec::new();
     for line in lines {
         if line.starts_with(' ') || line.starts_with('\t') {
             if let Some((_, value)) = headers.last_mut() {
-                value.push(' ');
+                // 前值为空时不插连接空格，否则续行会留下前导空格。
+                if !value.is_empty() {
+                    value.push(' ');
+                }
                 value.push_str(line.trim());
             }
             continue;
         }
         let Some((name, value)) = line.split_once(':') else {
-            return Err(format!("响应头行非法：{line:?}"));
+            return Err(format!("头行非法：{line:?}"));
         };
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim().to_owned();
@@ -331,12 +347,7 @@ fn parse_head_block(block: &[u8]) -> Result<ResponseHead, String> {
             None => headers.push((name, value)),
         }
     }
-
-    Ok(ResponseHead {
-        status,
-        status_text,
-        headers,
-    })
+    Ok(headers)
 }
 
 /// 依据请求方法与响应状态码定下体的封帧方式。
@@ -417,6 +428,312 @@ pub fn serialize_request(
     if let Some(bytes) = body {
         message.extend_from_slice(bytes);
     }
+    message
+}
+
+/// 已解析的请求行与请求头。
+#[derive(Debug, Clone)]
+pub struct RequestHead {
+    /// 方法（原样大小写，HTTP 方法区分大小写）。
+    pub method: String,
+    /// 请求目标（origin-form 如 `/p?q`，或代理使用的绝对式）。
+    pub target: String,
+    /// 版本号，如 `HTTP/1.1`。
+    pub version: String,
+    /// 请求头：键已小写，同名多值以 `, ` 合并。
+    pub headers: Vec<(String, String)>,
+}
+
+impl RequestHead {
+    /// 大小写不敏感取头值。
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let wanted = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(key, _)| *key == wanted)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// 解析出的完整请求：头部 + 已缓冲的体。
+#[derive(Debug, Clone)]
+pub struct ParsedRequest {
+    /// 请求行与头。
+    pub head: RequestHead,
+    /// 请求体字节。
+    pub body: Vec<u8>,
+}
+
+/// 请求体的封帧方式（与服务端不同：请求自带长度，不存在“以 EOF 结尾”）。
+#[derive(Debug, Clone, Copy)]
+enum RequestState {
+    Head,
+    Length { remaining: usize },
+    Chunked(ChunkedState),
+    Complete,
+}
+
+/// 增量请求解析器（服务端侧）。
+///
+/// 与 [`ResponseParser`] 同构，区别只在封帧判定：请求若无 `content-length` 且非 chunked，
+/// 就是**无体**（而非“读到 EOF”），否则 GET 会永远等下去。
+#[derive(Debug)]
+pub struct RequestParser {
+    state: RequestState,
+    buffer: Vec<u8>,
+    head: Option<RequestHead>,
+    body: Vec<u8>,
+}
+
+impl Default for RequestParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RequestParser {
+    /// 新建一个等待请求的解析器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: RequestState::Head,
+            buffer: Vec::new(),
+            head: None,
+            body: Vec::new(),
+        }
+    }
+
+    /// 喂入收到的字节。协议错误以 `Err` 消息表达。
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Progress, String> {
+        self.buffer.extend_from_slice(bytes);
+        self.consume()
+    }
+
+    /// 通知 EOF。请求自带封帧，提前 EOF 一律视为截断。
+    pub fn end_of_input(&mut self) -> Result<Progress, String> {
+        match self.state {
+            RequestState::Complete => Ok(Progress::Complete),
+            RequestState::Head => Err("连接在收到完整请求头之前关闭".to_owned()),
+            RequestState::Length { remaining } => Err(format!(
+                "请求体被截断：content-length 还差 {remaining} 字节"
+            )),
+            RequestState::Chunked(_) => Err("请求体被截断：分块传输未收到结束块".to_owned()),
+        }
+    }
+
+    /// 取出解析结果；未完成时返回错误而不是半成品。
+    pub fn into_request(self) -> Result<ParsedRequest, String> {
+        if !matches!(self.state, RequestState::Complete) {
+            return Err("请求尚未解析完成".to_owned());
+        }
+        let head = self.head.ok_or_else(|| "请求尚未解析完成".to_owned())?;
+        Ok(ParsedRequest {
+            head,
+            body: self.body,
+        })
+    }
+
+    /// 推进状态机，直到需要更多字节、完成或出错。
+    fn consume(&mut self) -> Result<Progress, String> {
+        loop {
+            match self.state {
+                RequestState::Head => match self.take_head()? {
+                    Progress::NeedMore => return Ok(Progress::NeedMore),
+                    Progress::Complete => continue,
+                },
+                RequestState::Length { remaining } => {
+                    let take = remaining.min(self.buffer.len());
+                    self.body.extend_from_slice(&self.buffer[..take]);
+                    self.buffer.drain(..take);
+                    if remaining == take {
+                        self.state = RequestState::Complete;
+                        return Ok(Progress::Complete);
+                    }
+                    self.state = RequestState::Length {
+                        remaining: remaining - take,
+                    };
+                    return Ok(Progress::NeedMore);
+                }
+                RequestState::Chunked(chunked) => match self.take_chunk(chunked)? {
+                    Progress::NeedMore => return Ok(Progress::NeedMore),
+                    Progress::Complete => continue,
+                },
+                RequestState::Complete => return Ok(Progress::Complete),
+            }
+        }
+    }
+
+    /// 切出一个请求头块（请求行 + 头 + 空行）。
+    fn take_head(&mut self) -> Result<Progress, String> {
+        let Some((end, terminator)) = find_head_end(&self.buffer) else {
+            return Ok(Progress::NeedMore);
+        };
+        let block = self.buffer[..end + terminator].to_vec();
+        self.buffer.drain(..end + terminator);
+
+        let head = parse_request_head_block(&block)?;
+        self.state = decide_request_framing(&head);
+        self.head = Some(head);
+        Ok(Progress::Complete)
+    }
+
+    /// 分块传输推进一步（与响应侧同构，写入 [`RequestState`]）。
+    fn take_chunk(&mut self, state: ChunkedState) -> Result<Progress, String> {
+        match state {
+            ChunkedState::Size => {
+                let Some(line) = take_line(&mut self.buffer) else {
+                    return Ok(Progress::NeedMore);
+                };
+                let size_text = line.split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(size_text, 16)
+                    .map_err(|_| format!("分块大小非法：{line:?}"))?;
+                self.state = RequestState::Chunked(if size == 0 {
+                    ChunkedState::Trailer
+                } else {
+                    ChunkedState::Data { remaining: size }
+                });
+                Ok(Progress::Complete)
+            }
+            ChunkedState::Data { remaining } => {
+                let take = remaining.min(self.buffer.len());
+                self.body.extend_from_slice(&self.buffer[..take]);
+                self.buffer.drain(..take);
+                if remaining == take {
+                    self.state = RequestState::Chunked(ChunkedState::DataCrlf);
+                    return Ok(Progress::Complete);
+                }
+                self.state = RequestState::Chunked(ChunkedState::Data {
+                    remaining: remaining - take,
+                });
+                Ok(Progress::NeedMore)
+            }
+            ChunkedState::DataCrlf => {
+                match self.buffer.first() {
+                    Some(b'\r') if self.buffer.len() >= 2 => {
+                        self.buffer.drain(..2);
+                    }
+                    Some(b'\n') => {
+                        self.buffer.drain(..1);
+                    }
+                    _ => return Ok(Progress::NeedMore),
+                }
+                self.state = RequestState::Chunked(ChunkedState::Size);
+                Ok(Progress::Complete)
+            }
+            ChunkedState::Trailer => {
+                loop {
+                    let Some(line) = take_line(&mut self.buffer) else {
+                        // 服务端在结束块后可能直接断开，补上 Trailer 区的空行。
+                        self.state = RequestState::Complete;
+                        return Ok(Progress::Complete);
+                    };
+                    if line.is_empty() {
+                        self.state = RequestState::Complete;
+                        return Ok(Progress::Complete);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 解析一个完整的请求头块（含结尾空行）。
+fn parse_request_head_block(block: &[u8]) -> Result<RequestHead, String> {
+    let text = String::from_utf8_lossy(block).into_owned();
+    let mut lines = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .filter(|line| !line.is_empty());
+
+    let request_line = lines.next().ok_or_else(|| "请求缺少请求行".to_owned())?;
+    let mut parts = request_line.splitn(3, ' ');
+    let method = parts
+        .next()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| format!("请求行非法：{request_line:?}"))?
+        .to_owned();
+    let target = parts
+        .next()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| format!("请求行缺目标：{request_line:?}"))?
+        .to_owned();
+    let version = parts.next().unwrap_or("").to_owned();
+    if !version.starts_with("HTTP/1.") {
+        return Err(format!("请求不是 HTTP/1.x：{request_line:?}"));
+    }
+
+    let headers = collect_headers(lines)?;
+    Ok(RequestHead {
+        method,
+        target,
+        version,
+        headers,
+    })
+}
+
+/// 依据请求头定下体封帧。无 `content-length` 且非 chunked 即为无体。
+fn decide_request_framing(head: &RequestHead) -> RequestState {
+    let transfer_encoding = head
+        .header("transfer-encoding")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if transfer_encoding
+        .split(',')
+        .any(|token| token.trim() == "chunked")
+    {
+        return RequestState::Chunked(ChunkedState::Size);
+    }
+    let Some(value) = head.header("content-length") else {
+        return RequestState::Complete;
+    };
+    let first = value.split(',').next().unwrap_or(value).trim();
+    match first.parse::<usize>() {
+        Ok(0) | Err(_) => RequestState::Complete,
+        Ok(length) => RequestState::Length { remaining: length },
+    }
+}
+
+/// 序列化响应报文：状态行 + 头 + 空行 + 体（服务端侧）。
+///
+/// M1 不做连接复用与分块回应：除非调用方自己给了 `content-length` / `connection`，
+/// 否则补 `content-length` 与 `connection: close`。204/304/1xx 不得带体，不写长度也不附体。
+#[must_use]
+pub fn serialize_response(
+    status: u16,
+    status_text: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> Vec<u8> {
+    let body_allowed = !(status == 204 || status == 304 || (100..200).contains(&status));
+    let mut wire = if status_text.is_empty() {
+        format!("HTTP/1.1 {status}\r\n")
+    } else {
+        format!("HTTP/1.1 {status} {status_text}\r\n")
+    };
+    let mut gave_length = false;
+    let mut gave_connection = false;
+    for (name, value) in headers {
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => gave_length = true,
+            "connection" => gave_connection = true,
+            _ => {}
+        }
+        wire.push_str(&format!("{name}: {value}\r\n"));
+    }
+    let body_bytes = if body_allowed {
+        body.unwrap_or_default()
+    } else {
+        &[]
+    };
+    if body_allowed && !gave_length {
+        wire.push_str(&format!("content-length: {}\r\n", body_bytes.len()));
+    }
+    if !gave_connection {
+        wire.push_str("connection: close\r\n");
+    }
+    wire.push_str("\r\n");
+    let mut message = wire.into_bytes();
+    message.extend_from_slice(body_bytes);
     message
 }
 
@@ -626,5 +943,107 @@ mod tests {
         );
         assert!(wire.contains("connection: close\r\n"));
         assert!(!wire.contains("content-length"), "无体请求不声明长度");
+    }
+
+    fn req_block(first: &str, headers: &[(&str, &str)]) -> String {
+        let mut text = format!("{first}\r\n");
+        for (name, value) in headers {
+            text.push_str(&format!("{name}: {value}\r\n"));
+        }
+        text.push_str("\r\n");
+        text
+    }
+
+    #[test]
+    fn parses_get_request_without_body() {
+        let mut parser = RequestParser::new();
+        let head = req_block("GET /index.html HTTP/1.1", &[("host", "h")]);
+        assert_eq!(parser.feed(head.as_bytes()).unwrap(), Progress::Complete);
+        let request = parser.into_request().unwrap();
+        assert_eq!(request.head.method, "GET");
+        assert_eq!(request.head.target, "/index.html");
+        assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn parses_content_length_body_split_across_feeds() {
+        let mut parser = RequestParser::new();
+        let head = req_block("POST /u HTTP/1.1", &[("content-length", "6")]);
+        assert_eq!(parser.feed(head.as_bytes()).unwrap(), Progress::NeedMore);
+        assert_eq!(parser.feed(b"ab").unwrap(), Progress::NeedMore);
+        assert_eq!(parser.feed(b"cdef").unwrap(), Progress::Complete);
+        assert_eq!(parser.into_request().unwrap().body, b"abcdef");
+    }
+
+    #[test]
+    fn parses_chunked_request_body() {
+        let mut parser = RequestParser::new();
+        let head = req_block("POST /u HTTP/1.1", &[("transfer-encoding", "chunked")]);
+        parser.feed(head.as_bytes()).unwrap();
+        parser.feed(b"4\r\nwiki\r\n").unwrap();
+        parser.feed(b"5\r\npedia\r\n").unwrap();
+        assert_eq!(parser.feed(b"0\r\n\r\n").unwrap(), Progress::Complete);
+        assert_eq!(parser.into_request().unwrap().body, b"wikipedia");
+    }
+
+    #[test]
+    fn request_with_no_length_or_chunked_is_not_body_delimited_by_eof() {
+        // 服务端关键区别：POST 无 content-length 代达为“无体”，不能等 EOF。
+        let mut parser = RequestParser::new();
+        let head = req_block("POST /u HTTP/1.1", &[("host", "h")]);
+        assert_eq!(parser.feed(head.as_bytes()).unwrap(), Progress::Complete);
+        assert!(parser.into_request().unwrap().body.is_empty());
+    }
+
+    #[test]
+    fn request_merges_duplicate_and_obs_fold_headers() {
+        let mut parser = RequestParser::new();
+        let wire = "GET / HTTP/1.1\r\nx-mio: a\r\nx-mio: b\r\nlong:\r\n folded\r\n\r\n";
+        assert_eq!(parser.feed(wire.as_bytes()).unwrap(), Progress::Complete);
+        let head = parser.into_request().unwrap().head;
+        assert_eq!(head.header("X-MIO"), Some("a, b"));
+        assert_eq!(head.header("long"), Some("folded"));
+    }
+
+    #[test]
+    fn request_accepts_bare_lf_and_rejects_bad_line() {
+        let mut parser = RequestParser::new();
+        let wire = "GET /a HTTP/1.1\nhost: h\n\n";
+        assert_eq!(parser.feed(wire.as_bytes()).unwrap(), Progress::Complete);
+
+        let mut bad = RequestParser::new();
+        assert!(bad.feed(b"GARBAGE\r\n\r\n").is_err());
+        let mut foreign = RequestParser::new();
+        assert!(foreign.feed(b"GET / HTTP/2.0\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn serialized_response_defaults_and_managed_headers() {
+        let wire = String::from_utf8(serialize_response(
+            200,
+            "OK",
+            &[
+                (String::from("content-type"), String::from("text/plain")),
+                (String::from("connection"), String::from("keep-alive")),
+            ],
+            Some(b"hi"),
+        ))
+        .unwrap();
+        assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
+        assert!(wire.contains("content-type: text/plain\r\n"));
+        assert!(wire.contains("content-length: 2\r\n"));
+        // 用户给的 connection 优先，不补 close。
+        assert!(wire.contains("connection: keep-alive\r\n"));
+        assert!(!wire.contains("connection: close"));
+        assert!(wire.ends_with("\r\n\r\nhi"));
+    }
+
+    #[test]
+    fn no_content_response_has_neither_length_nor_body() {
+        let wire = String::from_utf8(serialize_response(204, "No Content", &[], Some(b"ignored")))
+            .unwrap();
+        assert!(wire.starts_with("HTTP/1.1 204 No Content\r\n"), "{wire}");
+        assert!(!wire.contains("content-length"), "204 不得声明长度");
+        assert!(!wire.contains("ignored"), "204 不得附体");
     }
 }
