@@ -84,6 +84,7 @@ impl BoaEngine {
         super::encoding::install(&mut context);
         super::url::install(&mut context);
         super::performance::install(&mut context);
+        super::response::install(&mut context);
         Self {
             context,
             loader,

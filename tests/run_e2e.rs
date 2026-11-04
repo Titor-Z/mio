@@ -1251,6 +1251,70 @@ fn web_types_textencoder_blob_formdata_semantics() {
 }
 
 #[test]
+fn web_types_headers_response_semantics() {
+    let dir = unique_dir("web-resp");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "const h = new Headers({ 'X-A': '1', 'content-type': 'text/plain' });
+\
+         console.log('get', h.get('x-a'), h.get('X-A'), h.has('missing'));
+\
+         h.append('x-a', '2');
+\
+         console.log('merged', h.get('x-a'));
+\
+         h.set('x-a', '9');
+\
+         console.log('after set', h.get('x-a'));
+\
+         const r = new Response('hello', { status: 201, statusText: 'Created', headers: { 'content-type': 'text/plain' } });
+\
+         console.log('resp', r.status, r.ok, r.statusText, r.headers.get('content-type'), await r.text());
+\
+         const j = new Response(JSON.stringify({ a: 1 }), { headers: { 'content-type': 'application/json' } });
+\
+         console.log('json', (await j.json()).a);
+\
+         const nc = new Response('ignored', { status: 204 });
+\
+         console.log('nocontent', nc.status, (await nc.text()).length);
+\
+         const fromArray = new Headers([['a', '1'], ['a', '2']]);
+\
+         console.log('arr', fromArray.get('a'), [...fromArray].length);
+\
+         const iterated: Array<string> = [];
+\
+         h.forEach((value, key) => iterated.push(key + '=' + value));
+\
+         console.log('forEach', iterated.join(','));
+",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "Headers/Response 用例应成功退出：{output:?}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "get 1 1 false
+merged 1, 2
+after set 9
+resp 201 true Created text/plain hello
+json 1
+nocontent 204 0
+arr 1, 2 1
+forEach content-type=text/plain,x-a=9"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn microtask_storm_is_stopped_by_run_budget() {
     let dir = unique_dir("microtask-storm");
     std::fs::write(dir.join("mio.json"), "{ \"run\": { \"timeoutMs\": 800 } }").unwrap();
