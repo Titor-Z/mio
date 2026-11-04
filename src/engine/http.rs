@@ -86,14 +86,16 @@ pub(super) fn install(context: &mut Context) {
             list.len() - 1
         });
 
-        let addr = read_addr(args.get_or_undefined(1), context)?;
+        let options = args.get_or_undefined(1);
+        let addr = read_addr(options, context)?;
+        let tls = read_tls_config(options, context)?;
         let sender = engine_fetch::sender()
             .ok_or_else(|| JsNativeError::typ().with_message("serve: event channel unavailable"))?;
 
         // 先增计数再 spawn：循环据此保持存活，直到首个请求到达也来得及。
         LISTENING.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
-            let _ = webhttp::serve_loop(addr, move |request: &ParsedRequest| {
+            let handler = move |request: &ParsedRequest| -> ResponseSpec {
                 let (reply_tx, reply_rx) = mpsc::channel();
                 let inbound = ServerInbound {
                     handler_id,
@@ -109,7 +111,16 @@ pub(super) fn install(context: &mut Context) {
                     Ok(Err(message)) => ResponseSpec::text(500, &message),
                     Err(_) => ResponseSpec::text(500, "handler produced no response"),
                 }
-            });
+            };
+            // 带 cert/key → TLS；否则明文。二者共用同一 handler 与事件通道。
+            match tls {
+                Some(config) => {
+                    let _ = webhttp::serve_loop_tls(addr, handler, config);
+                }
+                None => {
+                    let _ = webhttp::serve_loop(addr, handler);
+                }
+            }
         });
 
         Ok(JsValue::undefined())
@@ -356,4 +367,32 @@ fn read_addr(options: &JsValue, context: &mut Context) -> JsResult<SocketAddr> {
         }
     }
     Ok(SocketAddr::new(host, port))
+}
+
+/// 从 `serve(handler, { cert, key })` 读 TLS 配置（PEM 文件路径）。
+///
+/// 两者都给 → HTTPS（返回配置）；都不给 → 明文（`None`）；只给一个 → 报错。
+fn read_tls_config(
+    options: &JsValue,
+    context: &mut Context,
+) -> JsResult<Option<webhttp::TlsConfig>> {
+    let Some(object) = options.as_object() else {
+        return Ok(None);
+    };
+    let cert = object.get(js_string!("cert"), context)?;
+    let key = object.get(js_string!("key"), context)?;
+    let cert_path = cert.as_string().map(|s| s.to_std_string_escaped());
+    let key_path = key.as_string().map(|s| s.to_std_string_escaped());
+    match (cert_path, key_path) {
+        (Some(cert), Some(key)) => {
+            let config = webhttp::tls_config_from_files(&cert, &key).map_err(|error| {
+                JsNativeError::typ().with_message(format!("serve TLS 配置失败：{error}"))
+            })?;
+            Ok(Some(config))
+        }
+        (None, None) => Ok(None),
+        _ => Err(JsNativeError::typ()
+            .with_message("serve 的 HTTPS 需要同时提供 `cert` 与 `key`（PEM 文件路径）")
+            .into()),
+    }
 }

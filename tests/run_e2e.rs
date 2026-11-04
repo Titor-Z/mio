@@ -9,6 +9,11 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 
 fn mio_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mio"))
@@ -1671,6 +1676,117 @@ serve((req) => {{
     assert!(second.starts_with("HTTP/1.1 200"), "{second}");
     assert!(first.ends_with("hit 1 /a"), "首响应：{first}");
     assert!(second.ends_with("hit 2 /b"), "次响应（同连接）：{second}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 测试专用：不验证服务器证书（自签证书无法用根信任链），只验证“TLS 握手能过 + 能跑 HTTP”。
+#[derive(Debug)]
+struct NoVerifier;
+
+impl ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+#[test]
+fn serve_https_handshake_and_request() {
+    // 用 rcgen（仅测试依赖）现签一个自签 ECDSA 证书，验证 serve 的 TLS 1.3 路径真的能握手 + 应答。
+    let port: u16 = 18105;
+    let dir = unique_dir("serve-https");
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("生成自签证书");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+    std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
+
+    let file = dir.join("server.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "serve((req) => new Response('secure-ok'), {{ port: {port}, cert: '{}', key: '{}' }});
+",
+            cert_path.to_str().unwrap().replace('\\', "/"),
+            key_path.to_str().unwrap().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(mio_binary())
+        .args(["run", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("启动 mio HTTPS 服务器进程");
+
+    // 等端口就绪（TLS 下探测连接会被握手失败关掉，但只要能连即端口已监听）。
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let out = child.wait_with_output().expect("回收");
+            panic!(
+                "serve 进程提前退出（{status}）：stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    // rustls 客户端（纯 Rust provider + TLS 1.3），不验证书，真走一次 TLS 握手游。
+    let config = ClientConfig::builder_with_provider(Arc::new(rustls_pure::provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    let name = ServerName::try_from("localhost").expect("server name");
+    let connection = rustls::ClientConnection::new(Arc::new(config), name).expect("客户端连接");
+    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("连接");
+    let mut tls = rustls::StreamOwned::new(connection, tcp);
+    tls.write_all(b"GET /secure HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .expect("写请求（触发握手）");
+    let mut response = String::new();
+    tls.read_to_string(&mut response).expect("读响应");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("secure-ok"), "{response}");
 
     std::fs::remove_dir_all(&dir).ok();
 }

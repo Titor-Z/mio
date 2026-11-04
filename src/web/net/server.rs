@@ -9,8 +9,14 @@
 //! 流式 body（ReadableStream）与分块回应仍是后续项。
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
+
+use rustls::ServerConfig;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::ServerConnection;
 
 use super::http::{self, Progress, RequestParser};
 
@@ -137,27 +143,123 @@ fn request_keep_alive(request: &http::ParsedRequest) -> bool {
     request.head.version == "HTTP/1.1"
 }
 
-/// 绑定地址并进入 accept 循环，每连接开一个线程交给 `handler`。
-///
-/// 返回监听端口（供调用方/测试得知实际端口，绑定 0 时尤其有用）。accept 后立即
-/// 移交连接线程、主循环回到 accept，故多个连接并发在途；连接线程上设空闲读超时。
-/// `handler` 需 `Clone + Send + 'static` 以便逐连接各拥一份。
+/// TLS 服务端配置句柄（已装的 rustls `ServerConfig`，纯 Rust provider）。
+pub type TlsConfig = Arc<ServerConfig>;
+
+/// 绑定地址并进入 accept 循环，每连接一个线程、明传输。keep-alive 同
+/// [`serve_loop_with`]。
 pub fn serve_loop<F>(addr: SocketAddr, handler: F) -> io::Result<u16>
 where
     F: Fn(&http::ParsedRequest) -> ResponseSpec + Send + Clone + 'static,
+{
+    serve_loop_with(addr, handler, plain_transport)
+}
+
+/// TLS 版 accept 循环：每条连接先用 `config` 完成 TLS 握手（rustls + 纯 Rust provider），
+/// 再把加密流交给同一个 [`handle_connection`]。握手/读写都走底层 socket 的空闲超时。
+pub fn serve_loop_tls<F>(addr: SocketAddr, handler: F, config: TlsConfig) -> io::Result<u16>
+where
+    F: Fn(&http::ParsedRequest) -> ResponseSpec + Send + Clone + 'static,
+{
+    let transport = move |stream: TcpStream| -> io::Result<TlsConn> {
+        let stream = net_stream(stream)?;
+        let connection = ServerConnection::new(config.clone()).map_err(tls_err)?;
+        Ok(TlsConn(rustls::StreamOwned::new(connection, stream)))
+    };
+    serve_loop_with(addr, handler, transport)
+}
+
+/// 一条 TLS 连接。包一层是为了在 [`Drop`] 时发 TLS `close_notify`：
+/// 否则直接抹掉 TCP 而无告警，客户端（含浏览器/curl）会把它当作截断攻击而报错。
+pub struct TlsConn(rustls::StreamOwned<ServerConnection, TcpStream>);
+
+impl Read for TlsConn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for TlsConn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Drop for TlsConn {
+    fn drop(&mut self) {
+        // 发 close_notify（rustls 内部缓存），再经 StreamOwned::flush 把 TLS 记录排干到 socket。
+        // 只 flush 裸 socket 不够：告警会卡在 rustls 的输出缓冲里、随进程消失。
+        self.0.conn.send_close_notify();
+        let _ = Write::flush(&mut self.0);
+    }
+}
+
+/// 通用 accept 循环：`transport` 把新到的 [`TcpStream`] 造成一个可读写的传输
+/// （明文或 TLS），其余（空闲超时、每连接一线程、keep-alive）与具体传输无关。
+fn serve_loop_with<T, F, G>(addr: SocketAddr, handler: F, transport: G) -> io::Result<u16>
+where
+    T: Read + Write + Send + 'static,
+    F: Fn(&http::ParsedRequest) -> ResponseSpec + Send + Clone + 'static,
+    G: Fn(TcpStream) -> io::Result<T> + Send + Sync + Clone + 'static,
 {
     let listener = TcpListener::bind(addr)?;
     let port = listener.local_addr()?.port();
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        // 空闲超时只在真实 socket 上设；handle_connection 对 WouldBlock/TimedOut 静默收尾。
-        let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
         let mut handler = handler.clone();
+        let transport = transport.clone();
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, &mut handler);
+            // 握手/传输建立失败：丢弃该连接，不影响监听循环。
+            if let Ok(transport) = transport(stream) {
+                let _ = handle_connection(transport, &mut handler);
+            }
         });
     }
     Ok(port)
+}
+
+/// 明文传输：给底层 socket 设空闲读超时后原样交回（具体类型 [`TcpStream`]，无需装箱）。
+fn plain_transport(stream: TcpStream) -> io::Result<TcpStream> {
+    net_stream(stream)
+}
+
+/// 对真实 socket 设空闲读超时；`handle_connection` 将 WouldBlock/TimedOut 当作静默收尾。
+fn net_stream(stream: TcpStream) -> io::Result<TcpStream> {
+    let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
+    Ok(stream)
+}
+
+/// 从 PEM 证书链 + 私钥文件构建 TLS 服务端配置（rustls + 纯 Rust `rustls_pure` provider，TLS 1.3）。
+///
+/// 证书需为 ECDSA P-256/P-384 或 Ed25519（provider 不验 RSA 签名）。私钥 PKCS#8 PEM。
+pub fn tls_config_from_files(cert_path: &str, key_path: &str) -> io::Result<TlsConfig> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(io_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io_err)?;
+    let key = PrivateKeyDer::from_pem_file(key_path).map_err(io_err)?;
+
+    let provider = Arc::new(rustls_pure::provider());
+    let config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(io_err)?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(io_err)?;
+    Ok(Arc::new(config))
+}
+
+/// 把任意 std 错误（含 rustls / pki 错误）装箱为 [`io::Error`]，便于统一 `?` 传递。
+fn io_err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(error: E) -> io::Error {
+    io::Error::other(error)
+}
+
+/// rustls 连接错误的别名（语义同 [`io_err`]）。
+fn tls_err(error: rustls::Error) -> io::Error {
+    io::Error::other(error)
 }
 
 /// 把解析层的字符串错误包装成 IO 错误。

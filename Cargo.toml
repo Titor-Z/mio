@@ -51,9 +51,15 @@ reactor = { package = "mio", version = "1", features = ["net", "os-poll"] }
 # 编解码（URLSearchParams 的序列化族）
 url = "2"
 form_urlencoded = "1"
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+rustls-pure = "0.15.4"
+rustls-pemfile = "2.2.0"
 
 [profile.release]
 # fat LTO 在本项目依赖规模下编译时间超过十分钟，采用 thin LTO 折中
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+rcgen = "0.14.10"
