@@ -26,6 +26,15 @@ pub enum Command {
     /// 执行配置文件中声明的任务；`name` 为 `None` 时列出全部任务。
     Task { name: Option<String> },
 
+    /// 在当前目录初始化项目骨架。
+    Init,
+
+    /// 刷新项目内的运行时类型声明。
+    Types,
+
+    /// 启动内置手册服务；`addr` 形如 `127.0.0.1:4173`。
+    Docs { addr: Option<String> },
+
     /// 打印版本文本。
     Version,
 
@@ -38,7 +47,14 @@ impl Command {
     pub fn entry_path(&self) -> Option<&std::path::Path> {
         match self {
             Self::Run { path } | Self::Check { path } => Some(path.as_path()),
-            Self::Eval { .. } | Self::Repl | Self::Task { .. } | Self::Version | Self::Help => None,
+            Self::Eval { .. }
+            | Self::Repl
+            | Self::Task { .. }
+            | Self::Init
+            | Self::Types
+            | Self::Docs { .. }
+            | Self::Version
+            | Self::Help => None,
         }
     }
 }
@@ -123,6 +139,12 @@ impl Cli {
             ["task", name] => Ok(Command::Task {
                 name: Some((*name).to_string()),
             }),
+            ["init"] => Ok(Command::Init),
+            ["types"] => Ok(Command::Types),
+            ["docs"] => Ok(Command::Docs { addr: None }),
+            ["docs", addr] => Ok(Command::Docs {
+                addr: Some((*addr).to_string()),
+            }),
             ["run"] => Err(String::from("run 子命令需要一个文件路径")),
             ["eval"] => Err(String::from("eval 子命令需要一段源码")),
             ["check"] => Err(String::from("check 子命令需要一个文件路径")),
@@ -161,6 +183,18 @@ mod tests {
             Command::Run {
                 path: PathBuf::from("app.ts")
             }
+        );
+    }
+
+    #[test]
+    fn parses_init_and_types() {
+        assert_eq!(
+            Cli::parse(["init"]).expect("应解析成功").command,
+            Command::Init
+        );
+        assert_eq!(
+            Cli::parse(["types"]).expect("应解析成功").command,
+            Command::Types
         );
     }
 

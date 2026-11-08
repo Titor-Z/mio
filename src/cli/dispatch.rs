@@ -20,6 +20,9 @@ mio —— TypeScript 一等公民的运行时
   mio repl              启动交互式求值环境
   mio check <file>      仅做类型检查（内置 tsrs 编译器，无外部依赖）
   mio task [name]       执行 mio.json 中声明的任务
+  mio init              在当前目录创建项目骨架与类型声明
+  mio types             刷新 .mio/@types/ 下的运行时类型声明
+  mio docs [host:port]  启动内置手册服务（默认 127.0.0.1:4173）
 
 选项:
   -c, --config <path>   指定配置文件路径
@@ -41,6 +44,9 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
             Ok(())
         }
         Command::Task { name } => run_task(config, name.as_deref()),
+        Command::Init => super::scaffold::init_current_dir(),
+        Command::Types => super::scaffold::refresh_types_current_dir(),
+        Command::Docs { addr } => crate::docs::serve(addr.as_deref()),
         Command::Run { path } => run_file(path, config),
         Command::Eval { source } => eval_source(source),
         Command::Repl => Err(not_implemented("repl")),
@@ -52,7 +58,8 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
 ///
 /// 参数对齐 mio 的运行语义：每个文件都按 ES Module 检查（`moduleDetection force` +
 /// `target/module esnext`），顶层 await 因此合法；`compilerOptions.strict` 附加 `--strict`。
-/// tsrs 自带 DOM lib，`fetch`/`Response`/`Headers`/`console` 无需额外声明文件。
+/// 内置声明（`types/mio/`）落到临时目录后作为额外根源文件传入，并用 `--lib esnext`
+/// 关掉 tsrs 默认的 DOM lib，避免与 mio 自己的 `URL`/`Response` 等声明冲突。
 /// 诊断由编译器自身按 `file:line:col error TSxxxx` 格式写到 stdout/stderr；
 /// 本函数只负责选择参数、在足够大的栈线程里跑（类型检查递归很深）、把退出码翻译成结果。
 fn check_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
@@ -60,12 +67,16 @@ fn check_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
 
     let strict = config.config.compiler_options.strict;
     let path = path.to_path_buf();
+    let builtin_types = super::scaffold::materialize_builtin_types()?;
     let status = std::thread::Builder::new()
         .stack_size(512 << 20)
         .spawn(move || {
             let host: &'static dyn tsc::System = Box::leak(Box::new(sys::new_system()));
             let mut args = vec![
                 String::from("--noEmit"),
+                // 项目里的 tsconfig.json 属于编辑器配置；mio check 只按运行语义检查入口文件，
+                // 不加载它（同时避开 tsgo 对「有 tsconfig 又显式给文件」的报错）。
+                String::from("--ignoreConfig"),
                 // 与 mio 运行时的模块语义对齐：每个文件都是 ES Module（顶层 await 因此合法）。
                 String::from("--moduleDetection"),
                 String::from("force"),
@@ -73,10 +84,14 @@ fn check_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
                 String::from("esnext"),
                 String::from("--module"),
                 String::from("esnext"),
+                // mio 的全局面不是 DOM：只加载 ES lib，其余由内置声明提供。
+                String::from("--lib"),
+                String::from("esnext"),
             ];
             if strict {
                 args.push(String::from("--strict"));
             }
+            args.push(builtin_types.to_string_lossy().into_owned());
             args.push(path.to_string_lossy().into_owned());
             let result = execute::command_line(host, args);
             tsc::System::flush(host);

@@ -39,6 +39,9 @@ mio eval "..."         # 执行内联源码
 mio repl               # 交互式求值
 mio check app.ts       # 仅类型检查（内置 tsrs 编译器）
 mio task <name>        # 执行 mio.json 声明的任务
+mio init               # 初始化项目（含编辑器类型声明）
+mio types              # 刷新 .mio/@types/ 下的类型声明
+mio docs [host:port]   # 启动内置手册（默认 127.0.0.1:4173）
 ```
 
 ## 目录结构
@@ -56,6 +59,8 @@ src/
   sourcemap/     错误位置映射回 TypeScript 源码
   web/           Web 标准库（全局对象）
   stdlib/        @std/* 内建模块
+types/mio/       运行时类型声明（编译进二进制，由 mio init 复制到项目）
+site/            手册源码（VitePress）；site/dist/ 为构建产物，编译期嵌入二进制
 ```
 
 ## 配置

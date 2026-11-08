@@ -1,0 +1,15 @@
+{
+  // 仓库内的编辑器配置示例：只覆盖 examples/，给 VS Code 等 LSP 提供 mio 类型。
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext"],
+    "typeRoots": ["./types"],
+    "types": ["mio"],
+    "strict": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["examples/**/*.ts", "types/**/*.d.ts"]
+}

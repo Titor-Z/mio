@@ -789,7 +789,7 @@ fn fetch_timeout_rejects_with_budget_from_config() {
 fn check_accepts_top_level_await_and_fetch_types() {
     let dir = unique_dir("check-fetch");
     let file = dir.join("app.ts");
-    // 顶层 await + fetch：tsrs 自带 DOM lib，且 moduleDetection 已按运行时语义对齐，应零诊断。
+    // 顶层 await + fetch：内置声明提供 fetch/console，moduleDetection 已按运行时语义对齐，应零诊断。
     std::fs::write(
         &file,
         "interface Payload { answer: number }\n\
@@ -803,6 +803,31 @@ fn check_accepts_top_level_await_and_fetch_types() {
     assert!(
         output.status.success(),
         "合法 fetch/TLA 代码应通过检查：{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_knows_mio_globals_and_std_modules() {
+    let dir = unique_dir("check-mio-types");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "import { join } from '@std/path';\n\
+         serve((req) => {\n\
+           const path: string = join('a', 'b');\n\
+           console.log(req.method, path);\n\
+           return new Response('ok');\n\
+         });\n",
+    )
+    .unwrap();
+
+    let output = run(&["check", file.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "serve/@std/path/Response 应被内置声明识别：{:?}",
         String::from_utf8_lossy(&output.stdout)
     );
 

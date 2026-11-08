@@ -22,3 +22,6 @@ docs/Taolun.md
 # 环境变量文件
 .env
 .env.local
+
+# 站点依赖（dist/ 需要提交，供二进制内嵌）
+site/node_modules/

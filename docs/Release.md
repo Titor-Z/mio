@@ -7,9 +7,34 @@ TodoID 规则：`TD` + UUID。TaolunID 规则：`TL` + `YYYYMMDDThhmmss`。
 
 ---
 
-## 0.1.0（未发布）
+## 0.2.0（2026-11-09）
 
-**状态**：开发中，尚未发布。
+**状态**：已发布。
+
+**更新内容**
+
+- 新增 `types/mio/` 运行时类型声明，覆盖 Web 全局对象与 `@std/path`，编译期嵌入二进制。
+- 新增 `mio init` 与 `mio types`，生成并刷新用户项目内的 `.mio/@types/mio/` 与 `tsconfig.json`。
+- `mio check` 注入内置声明并使用 `--lib esnext`，项目存在 `tsconfig.json` 时不再触发 TS5112。
+- 用户文档迁至 `site/`，内容与实现逐项对齐。
+- 新增 `mio docs [host:port]`：VitePress 手册、包豪斯 / 构成主义主题、静态资源嵌入二进制，离线可查。
+- 新增 `include_dir` 依赖（纯 Rust），用于手册目录嵌入。
+
+**TodoLists[]**
+
+- TDa89497f21b6645cbbe823b82c16fe651（类型声明与文档）
+- TD372b08ea5a654b2492ab1cb5cff4e2d2（内置手册 `mio docs`）
+
+**关联讨论**
+
+- TL20261109T011352
+- TL20261109T015014
+
+---
+
+## 0.1.0（2026-11-05）
+
+**状态**：已发布。
 
 **更新内容**
 

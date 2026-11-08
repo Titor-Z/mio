@@ -9,6 +9,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod docs;
 pub mod engine;
 pub mod lexer;
 pub mod loader;

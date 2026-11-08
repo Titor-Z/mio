@@ -3,32 +3,32 @@
 本文件只保留最新一个版本的发布说明，供 GitHub Actions 生成 release 使用。
 历史版本记录见 `docs/Release.md`。
 
-## 0.1.0（未发布）
+## 0.2.0
 
-### 立项与仓库形态
+### 运行时类型声明与项目脚手架
 
-- 新建 `mio` 仓库，定位为 TypeScript 一等公民的运行时：TypeScript 源文件直接作为输入语言，运行时内部完成类型擦除与执行。
-- 项目分两阶段：阶段 A 借助 OXC 与 Boa 完成转译与执行；阶段 B 自研词法、语法、语义与字节码虚拟机，直接消费类型信息并输出原生代码。
-- 明确不提供 Node.js 与 CommonJS 兼容层：不解析 `node_modules`、不支持 `require`、不推断 `package.json` 入口、不支持裸包名。模块图因此完全静态可分析。
-- 技术栈固定为 Rust 1.97.1、Boa 0.22、OXC 0.156，均可在稳定版 Rust 上编译，无需 nightly。
+- 新增 `types/mio/`：手写声明与实现逐项对齐，覆盖 `console`、定时器、`performance`、`URL` / `URLSearchParams`、`TextEncoder` / `TextDecoder`、`Blob` / `FormData` / `File`、`Headers` / `Response` / `Request`、`fetch` / `AbortController` 与 `serve`，以及 `@std/path`。
+- 声明在编译期通过 `include_str!` 嵌入二进制，不依赖外部文件。
+- 新增 `mio init`：生成 `mio.json`、`tsconfig.json`、`.mio/@types/mio/`、`src/main.ts` 与 `.gitignore`；已存在的配置不覆盖。
+- 新增 `mio types`：运行时升级后刷新项目内的类型声明。
+- `tsconfig.json` 定位为“仅编辑器的类型适配层”：`lib: ["ESNext"]`、`typeRoots: [".mio/@types"]`、`types: ["mio"]`，运行配置仍以 `mio.json` 为唯一真相。
+- `mio check` 内置声明注入：声明落到系统临时目录并作为额外根源文件传入，同时以 `--lib esnext` 关闭 tsrs 默认 DOM lib，避免与 mio 的 `URL` / `Response` 声明冲突；新增 `--ignoreConfig`，项目存在 `tsconfig.json` 时不再触发 TS5112。
+- 修正 `/// <reference>` 位置：三斜线指令必须位于文件前导注释，放在末尾不会生效。
 
-### 配置系统
+### 使用文档
 
-- 配置文件 `mio.json` 采用 `tsconfig.json` 骨架：顶层 `compilerOptions`、`include` / `exclude` / `files` 文件选择、`extends` 继承、JSONC 注释、`$schema` 提示。
-- 模块映射不采用 `compilerOptions.paths` / `baseUrl`：二者为编译期概念，不影响产物且依赖打包器配合。改用 Import Maps 规范的 `imports` / `scopes`，支持精确映射与最长前缀映射。映射目标为 `npm:` / `node:` / 裸包名时给出明确报错。
-- 字段分四档生效状态：生效、仅提示、预留、不采用。后两档在加载时打印告警，避免「写进配置却无人读取」。
-- `extends` 在 JSON 值层面深合并，对象逐字段合并、数组整体覆盖；支持字符串与数组形态、省略 `.json` 后缀、检出循环继承、链深度上限 16。
-- 配置发现从入口文件所在目录向上查找最近一份，找到即止；`--config` 可强制指定。
-- 优先级：内建默认 < 配置文件（含继承链） < `MIO_*` 环境变量 < 命令行选项。
-- 字符串支持 `$VAR` 与 `${VAR}` 展开；未定义变量原样保留，不替换为空串。
-- 未知字段不导致失败，但输出「未知字段 + 编辑距离最接近的合法字段」告警。
-- 通配匹配以路径段为单位实现，支持 `*`、`?`、`**`，配合记忆化避免指数级回溯。
-- `mio task` 可读取配置中声明的任务并按名列出。
+- 用户文档从 `docs/` 剥离到 `site/`：上手指南、快速参考、Node/Deno 兼容性对比。
+- 文档内容与实现对齐：`Response` 无静态 `json/text`、`console` 只有 `log`、`setTimeout` 返回数值 id、`Request` 不可自行构造、`fetch` 的 headers 只接受普通对象。
 
-### 工程骨架
+### 内置手册 `mio docs`
 
-- 单 crate，edition 2024，模块按面向对象分层：`cli`、`config`、`transpiler`、`resolver`、`loader`、`engine`、`sourcemap`、`web`、`stdlib`。
-- 建立两个阶段共用的接缝：`engine::Engine` 执行引擎抽象，`resolver::Specifier` 说明符分类。
-- `engine::Engine` 内置 `boa_*` 依赖隔离约束，其他模块不得直接引用具体引擎。
-- 命令行支持 `--version` 与 `--help`，其余子命令返回未实现提示。
-- 测试 64 项通过（57 单元 + 7 端到端），`clippy -D warnings` 与 `cargo fmt --check` 均为干净状态。
+- 新增 `mio docs [host:port]`：启动内置手册服务，默认 `127.0.0.1:4173`，离线可用。
+- 手册使用 VitePress 构建，自定义包豪斯 / 构成主义主题：纸张底色、3px 纯黑结构线、红/蓝/黄三原色、拼贴式布局与几何色块。
+- `site/dist/` 构建产物提交进仓库，Rust 侧通过 `include_dir!` 编译期整目录嵌入，`cargo build` 不再需要 Node.js。
+- 静态服务使用 `TcpListener`，支持 GET/HEAD、干净链接（`/guide` → `guide.html`）、内置 404 页与百分号解码；只查嵌入文件表，不触磁盘。
+- 新增依赖 `include_dir`，保持纯 Rust。
+
+### 其它
+
+- 新增仓库根 `tsconfig.json`，供编辑器验证 `examples/` 下的示例代码。
+- README 补充 `mio init`、`mio types`、`mio docs` 与新目录结构。

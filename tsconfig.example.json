@@ -1,0 +1,15 @@
+{
+  // 编辑器类型提示示例（真实项目请直接 `mio init` 生成）
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext"],
+    "typeRoots": [".mio/@types"],
+    "types": ["mio"],
+    "strict": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"]
+}

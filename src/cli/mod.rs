@@ -9,9 +9,12 @@
 //! - `mio repl`         交互式求值
 //! - `mio check <file>` 仅做类型检查（内置 tsrs 编译器，无外部依赖）
 //! - `mio task <name>`  执行 `mio.json` 中声明的任务
+//! - `mio init`         在当前目录创建项目骨架
+//! - `mio types`        刷新运行时的类型声明
 
 mod args;
 mod dispatch;
+mod scaffold;
 
 pub use args::{Cli, Command};
 pub use dispatch::dispatch;
