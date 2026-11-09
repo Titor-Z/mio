@@ -192,8 +192,6 @@ impl FileInfo {
             created: cre_time,
             #[cfg(unix)]
             permissions: perms,
-            #[cfg(not(unix))]
-            permissions: 0o644,
         }
     }
 }
