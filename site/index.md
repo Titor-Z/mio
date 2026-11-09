@@ -32,4 +32,7 @@ features:
   - icon: "06"
     title: 纯 Rust 运行时
     details: 转译由 OXC 承担，执行由 Boa 承担，TLS 使用 rustls 纯 Rust 后端。不引入 C 依赖。
+  - icon: "07"
+    title: 高性能文件系统
+    details: "@std/fs 提供 Promise 风格读写，IO 走工作线程池不阻塞事件循环；支持 FD 控制层分块与流式读写。"
 ---

@@ -9,6 +9,7 @@
 //! 组装成合成模块，是 `engine/loader.rs` 的职责（那里允许 `boa_*`）。
 //! 阶段 B 更换引擎时，本模块的算法与描述表原样复用。
 
+pub(crate) mod fs;
 mod path;
 
 /// 一个内建函数的底层实现：接收脚本侧已转为 Rust `&str` 的实参，返回字符串结果或错误文本。
@@ -38,6 +39,11 @@ pub struct BuiltinModule {
 /// 按 `@std/<name>` 中的 `name` 查找内建模块；未注册返回 `None`。
 pub fn lookup(name: &str) -> Option<BuiltinModule> {
     match name {
+        "fs" => Some(BuiltinModule {
+            name: "fs",
+            functions: &[], // fs 由 engine 专用构建器装配（见 engine/loader.rs::build_fs_module）
+            string_constants: &[],
+        }),
         "path" => Some(BuiltinModule {
             name: "path",
             functions: path::FUNCTIONS,
@@ -58,6 +64,12 @@ mod tests {
         assert!(names.contains(&"join"));
         assert!(names.contains(&"basename"));
         assert_eq!(module.string_constants, &[("separator", "/")]);
+    }
+
+    #[test]
+    fn lookup_fs_exists() {
+        let module = lookup("fs").expect("@std/fs 应已注册");
+        assert!(module.functions.is_empty()); // fs 的导出由 engine 侧处理
     }
 
     #[test]

@@ -238,7 +238,62 @@ extname("archive.tar.gz");          // ".gz"
 normalize("/foo/../bar/./baz");     // "/bar/baz"
 ```
 
-## 4. 调试技巧
+### 3.7 `@std/fs` 文件操作
+
+所有文件 API 都返回 Promise，底层 IO 在工作线程池执行，**不会阻塞事件循环**（定时器、在途 fetch 照常运转）。
+
+常用便捷接口：
+
+```ts
+import * as fs from "@std/fs";
+
+await fs.writeTextFile("a.txt", "你好");
+const text = await fs.readTextFile("a.txt");   // string
+const bytes = await fs.readFile("a.bin");       // Uint8Array
+await fs.writeFile("a.bin", bytes);
+
+const info = await fs.stat("a.txt");           // { isFile, isDirectory, size, ... }
+await fs.exists("a.txt");                       // boolean
+await fs.mkdir("nested/dir");                   // 递归创建
+await fs.readdir("nested");                     // string[]
+await fs.copyFile("a.txt", "b.txt");
+await fs.rename("b.txt", "c.txt");
+await fs.remove("c.txt");                       // 文件或目录
+```
+
+需要分块/流式读写时用 FD 控制层：
+
+```ts
+const file = await fs.open("big.bin", "r");    // 模式 "r" | "w" | "a"
+const chunk = new Uint8Array(64 * 1024);
+let n = await file.read(chunk);                 // 返回实际读取字节数，0 表示 EOF
+await file.close();
+```
+
+> 没有同步版本（`readFileSync` 之类）：用 `await` 即可表达同步语义，且不会冻结事件循环。
+
+## 4. 交互式 REPL
+
+直接运行 `mio repl` 进入交互式求值，变量与函数声明在多次输入之间保持：
+
+```bash
+mio repl
+> const x: number = 2 * 3;
+> x + 1
+7
+> function f(n: number) {
+...   return n * n;
+... }
+> f(5)
+25
+```
+
+- 按括号配平自动续行（提示符从 `> ` 变为 `... `）。
+- 出错只打印、不退出。
+- 输入 `:quit` 或按 Ctrl-D 退出。
+- 与 `mio eval` 一样不支持顶层 `await`；需要异步请写成文件用 `mio run`。
+
+## 5. 调试技巧
 
 ### 4.1 控制台输出
 
@@ -252,7 +307,7 @@ console.log("Debug:", value);
 
 如果程序卡住，通常是事件循环没有驱动微任务。确保在你的 handler 中正确处理 Promise 链。
 
-## 5. 离线手册
+## 6. 离线手册
 
 运行时自带完整手册，不联网也能查：
 
@@ -263,7 +318,7 @@ mio docs 0.0.0.0:8080     # 指定监听地址
 
 手册页面由 VitePress 构建，静态资源已嵌入二进制。
 
-## 6. 常见问题
+## 7. 常见问题
 
 ### Q: 为什么编辑器提示 `window is not defined`？
 
@@ -271,7 +326,7 @@ A: mio 是后端运行时，没有浏览器环境。请确保：
 1. 不要在代码中使用 `window`, `document` 等 DOM API
 2. `tsconfig.json` 中不要添加 `"lib": ["dom"]`
 
-### Q: 为什么 `@std/path` 找不到？
+### Q: 为什么 `@std/*` 模块（如 `@std/path`、`@std/fs`）找不到？
 
 A: 先确认已执行 `mio init`，并且 `tsconfig.json` 里有：
 

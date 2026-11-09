@@ -14,6 +14,7 @@
 
 mod args;
 mod dispatch;
+mod repl;
 mod scaffold;
 
 pub use args::{Cli, Command};

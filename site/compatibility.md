@@ -29,17 +29,21 @@
 
 | API | mio | Node.js | Deno |
 |---|---|---|---|
-| `fs.readFileSync` | ❌ | ✅ | ✅ |
-| `fs.readFile` | ❌ | ✅ | ✅ |
-| `path.join` | ✅ `@std/path` | ✅ `path` | ✅ `std/path` |
+| `readFile` / `readTextFile` | ✅ `@std/fs` | ✅ | ✅ |
+| `writeFile` / `writeTextFile` | ✅ `@std/fs` | ✅ | ✅ |
+| `stat` / `exists` / `mkdir` / `readdir` / `remove` / `copyFile` / `rename` | ✅ `@std/fs` | ✅ | ✅ |
+| `open` + `read` / `write` / `close`（FD 流式） | ✅ `@std/fs` | ✅ | ✅ |
+| 同步 API（`readFileSync` 等） | ❌ 用 `await` | ✅ | ⚠️ |
+| 文件监听 `watch` | ❌ | ✅ | ⚠️ |
 
-> **注意**: mio v0.1 阶段暂不提供文件系统 API，专注于 Web API。
+> mio 的文件 API 全部返回 Promise，底层 IO 在工作线程池执行，不阻塞事件循环；不提供同步版本（用 `await` 即可表达同步语义）。
 
 ## 标准库
 
 | 模块 | mio | Node.js | Deno |
 |---|---|---|---|
 | `@std/path` | ✅ 自有实现 | `path` | `std/path` |
+| `@std/fs` | ✅ 自有实现 | `fs` | `std/fs` |
 | `crypto` | ❌ | ✅ | ✅ |
 | `process.env` | ❌ | ✅ | `Deno.env` |
 
@@ -124,6 +128,20 @@ const res = await request.get(url);
 ```ts
 // mio (native!)
 const res = await fetch(url);
+```
+
+#### 4. 替换文件读写
+
+```js
+// Node.js
+const fs = require("fs");
+const text = fs.readFileSync("a.txt", "utf8");
+```
+
+```ts
+// mio：全部异步，用 await 表达同步语义
+import * as fs from "@std/fs";
+const text = await fs.readTextFile("a.txt");
 ```
 
 ### 从 Deno 迁移

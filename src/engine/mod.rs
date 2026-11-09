@@ -14,6 +14,7 @@ mod budget;
 mod encoding;
 mod error;
 mod fetch;
+pub(crate) mod fs;
 mod http;
 mod loader;
 mod performance;

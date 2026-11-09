@@ -22,7 +22,7 @@ mio types    # 运行时升级后刷新 .mio/@types/mio/
 }
 ```
 
-`.mio/@types/` 建议提交进 git，`.mio/cache/` 忽略。
+`.mio/@types/` 建议提交进 git。
 
 ## 已声明 API
 

@@ -49,7 +49,7 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
         Command::Docs { addr } => crate::docs::serve(addr.as_deref()),
         Command::Run { path } => run_file(path, config),
         Command::Eval { source } => eval_source(source),
-        Command::Repl => Err(not_implemented("repl")),
+        Command::Repl => super::repl::run(),
         Command::Check { path } => check_file(path, config),
     }
 }
@@ -175,9 +175,4 @@ fn run_task(config: &LoadedConfig, name: Option<&str>) -> CliResult {
             None => Err(format!("配置中不存在任务 {task_name}")),
         },
     }
-}
-
-/// 统一构造「尚未实现」错误，避免各分支重复拼接文案。
-fn not_implemented(what: &str) -> String {
-    format!("{what}：该功能尚未实现")
 }

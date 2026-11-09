@@ -163,6 +163,12 @@ impl TsModuleLoader {
 /// 初始化闭包只捕获 `&'static` 切片（均为 `Copy`），故可用 `from_copy_closure`；
 /// 真正的 `NativeFunction` 在求值时按 `crate::stdlib` 的纯函数现场构造。
 fn build_builtin(name: &str, context: &mut Context) -> JsResult<Module> {
+    // `fs` 返回 Promise / 对象 / 二进制，无法用「字符串进、字符串出」的通用装配，
+    // 由 engine 侧专用构建器负责。
+    if name == "fs" {
+        return crate::engine::fs::build_fs_module(context);
+    }
+
     let builtin = crate::stdlib::lookup(name).ok_or_else(|| {
         JsNativeError::typ().with_message(format!("未知的内建模块 `@std/{name}`"))
     })?;

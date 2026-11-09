@@ -4,6 +4,7 @@
 // 编辑器需配置 "lib": ["ESNext"]，不要引入 DOM 库。
 
 /// <reference path="./std/path.d.ts" />
+/// <reference path="./std/fs.d.ts" />
 
 // =========================
 // Console

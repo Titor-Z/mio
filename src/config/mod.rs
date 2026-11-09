@@ -55,7 +55,7 @@ pub struct MioConfig {
     /// 预留：本版本解析但不参与解析决策。
     pub scopes: BTreeMap<String, BTreeMap<String, String>>,
 
-    /// 参与构建的文件通配模式。生效（`mio build` 使用）。
+    /// 参与文件筛选的通配模式（不进 git 时作为默认范围）。生效。
     pub include: Vec<String>,
 
     /// 排除的文件通配模式。生效。
@@ -76,9 +76,6 @@ pub struct MioConfig {
 
     /// 执行期行为。生效。
     pub run: RunConfig,
-
-    /// 构建产物。生效（里程碑 3）。
-    pub build: BuildConfig,
 
     /// mio 自身诊断输出。生效。
     pub log: LogConfig,
@@ -186,26 +183,6 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self { timeout_ms: 30_000 }
-    }
-}
-
-/// 构建产物配置。
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct BuildConfig {
-    /// 预转译产物目录。生效（里程碑 3）。
-    pub out_dir: String,
-
-    /// 是否落盘源码映射。生效（里程碑 3）。
-    pub sourcemap: bool,
-}
-
-impl Default for BuildConfig {
-    fn default() -> Self {
-        Self {
-            out_dir: String::from(".mio/cache"),
-            sourcemap: true,
-        }
     }
 }
 

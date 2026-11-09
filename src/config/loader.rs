@@ -503,13 +503,13 @@ mod tests {
         let dir = write_config(
             "env",
             CONFIG_FILE_NAME,
-            r#"{ "build": { "outDir": "${MIO_OUT}/dist" } }"#,
+            r#"{ "module": { "root": "${MIO_OUT}/dist" } }"#,
         );
 
         let loaded = ConfigLoader::load(&dir, None, &ConfigOverride::default(), &environment)
             .expect("应加载成功");
 
-        assert_eq!(loaded.config.build.out_dir, "/tmp/out/dist");
+        assert_eq!(loaded.config.module.root, "/tmp/out/dist");
     }
 
     #[test]
@@ -517,7 +517,7 @@ mod tests {
         let dir = write_config(
             "env_missing",
             CONFIG_FILE_NAME,
-            r#"{ "build": { "outDir": "$MIO_ABSENT" } }"#,
+            r#"{ "module": { "root": "$MIO_ABSENT" } }"#,
         );
 
         let loaded = ConfigLoader::load(
@@ -528,7 +528,7 @@ mod tests {
         )
         .expect("应加载成功");
 
-        assert_eq!(loaded.config.build.out_dir, "$MIO_ABSENT");
+        assert_eq!(loaded.config.module.root, "$MIO_ABSENT");
     }
 
     #[test]

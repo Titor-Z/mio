@@ -7,6 +7,34 @@ TodoID 规则：`TD` + UUID。TaolunID 规则：`TL` + `YYYYMMDDThhmmss`。
 
 ---
 
+## 0.2.1（2026-11-09）
+
+**状态**：已发布。
+
+**更新内容**
+
+- 新增 `@std/fs`：Promise 风格文件 API，底层工作线程池执行、经事件循环单通道回传，不阻塞事件循环。
+- 新增 FD 控制层：`open` / `File.read` / `File.write` / `File.close`，支持分块与流式读写；不提供同步 API。
+- 新增 `mio repl`：持久状态、括号配平多行续行、错误不退出。
+- 类型声明补 `@std/fs`（`FileInfo` / `File` / `OpenMode` / `open`）。
+- 取消未实现的「预转译缓存」`mio build`，移除 `build` 配置项与 `.mio/cache/` 脚手架提示（未来做真正的 build）。
+- 手册同步更新：`@std/fs` 章节、REPL、文件系统兼容性与快速参考。
+
+**TodoLists[]**
+
+- TD1e49b48058a64fc590a3cd9f93ca7c12（里程碑 2）
+- TDa1c9c763253d4e7fb424909bfa5b7a56（`@std/fs` Phase 1）
+- TDc384bc35814e4f169d670bb39507bc76（`@std/fs` Phase 2）
+- TDc037166c009f429bb01c0f759f62d71b（REPL）
+
+**关联讨论**
+
+- TL20251109T160000
+- TL20251109T173000
+- TL20251109T180000
+
+---
+
 ## 0.2.0（2026-11-09）
 
 **状态**：已发布。

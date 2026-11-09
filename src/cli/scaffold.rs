@@ -14,6 +14,9 @@ const TYPES_INDEX: &str = include_str!("../../types/mio/index.d.ts");
 /// `@std/path` 类型声明。
 const STD_PATH: &str = include_str!("../../types/mio/std/path.d.ts");
 
+/// `@std/fs` 类型声明。
+const STD_FS: &str = include_str!("../../types/mio/std/fs.d.ts");
+
 /// 初始化生成的运行配置。
 const MIO_JSON: &str = r#"{
   // mio 运行配置：影响运行行为的唯一真相。
@@ -53,8 +56,8 @@ const MAIN_TS: &str = r#"const message: string = "Hello, mio!";
 console.log(message);
 "#;
 
-/// `.gitignore` 初始内容：只忽略缓存，类型声明应提交。
-const GITIGNORE: &str = ".mio/cache/\n";
+/// `.gitignore` 初始内容：类型声明应提交，故默认不忽略任何目录。
+const GITIGNORE: &str = "# 项目级忽略规则写在这里\n";
 
 /// `mio init`：在当前目录补齐项目骨架，已存在的配置不覆盖。
 pub(super) fn init_current_dir() -> CliResult {
@@ -90,13 +93,15 @@ pub(super) fn materialize_builtin_types() -> Result<PathBuf, String> {
     let index = dir.join("mio/index.d.ts");
     write_file(&index, TYPES_INDEX)?;
     write_file(&dir.join("mio/std/path.d.ts"), STD_PATH)?;
+    write_file(&dir.join("mio/std/fs.d.ts"), STD_FS)?;
     Ok(index)
 }
 
 /// 写入类型声明，总是覆盖（生成物以运行时自带版本为准）。
 fn write_types(root: &Path) -> CliResult {
     write_file(&root.join(".mio/@types/mio/index.d.ts"), TYPES_INDEX)?;
-    write_file(&root.join(".mio/@types/mio/std/path.d.ts"), STD_PATH)
+    write_file(&root.join(".mio/@types/mio/std/path.d.ts"), STD_PATH)?;
+    write_file(&root.join(".mio/@types/mio/std/fs.d.ts"), STD_FS)
 }
 
 /// 文件不存在才写入，避免覆盖用户已有配置。

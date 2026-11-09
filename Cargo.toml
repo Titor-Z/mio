@@ -1,6 +1,6 @@
 [package]
 name = "mio"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.97.0"
 description = "TypeScript 一等公民的运行时：TS 源码直接作为输入，运行时内部完成类型擦除与执行"

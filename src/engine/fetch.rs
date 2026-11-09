@@ -37,6 +37,8 @@ pub(super) enum LoopEvent {
     Fetch(FetchResult),
     /// 服务端线程收到一条完整请求，等待引擎线程同步处理并回线。
     Server(engine_http::ServerInbound),
+    /// 一个 fs 工作线程的终局。
+    Fs(super::fs::FsResult),
 }
 
 /// 尚未 settle 的 Promise 两端句柄（仅存活于引擎线程）。

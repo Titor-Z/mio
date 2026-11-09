@@ -4,7 +4,7 @@
 **/*.rs.bk
 *.pdb
 
-# 运行期缓存目录（mio build 的预转译产物）
+# mio 工作目录（本仓库自身不使用，忽略以免误提交）
 .mio/
 
 # AGENTS.md 与 docs/Taolun.md 仅存在本地，不对外发布：

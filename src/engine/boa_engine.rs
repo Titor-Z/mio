@@ -25,6 +25,7 @@ use boa_engine::{Context, JsError, JsObject, JsValue, NativeFunction, Source, js
 
 use super::budget::{StopKey, Watchdog, WatchdogHandle};
 use super::fetch::{self as engine_fetch, FetchResult, LoopEvent};
+use super::fs as engine_fs;
 use super::http as engine_http;
 use super::loader::TsModuleLoader;
 use super::timers as engine_timers;
@@ -223,11 +224,12 @@ impl BoaEngine {
             }
 
             let has_fetch = engine_fetch::has_pending();
+            let has_fs = engine_fs::has_pending();
             let has_serve = engine_http::is_listening();
             let has_pending_handler = engine_http::has_pending();
             let timer_wait = engine_timers::next_deadline()
                 .map(|due| due.saturating_duration_since(Instant::now()).min(budget));
-            if !has_fetch && !has_serve && !has_pending_handler && timer_wait.is_none() {
+            if !has_fetch && !has_fs && !has_serve && !has_pending_handler && timer_wait.is_none() {
                 return Ok(());
             }
             // 单一等待点：事件通道（fetch 完成 + 进来的请求）或定时器超时，先到者唤醒。
@@ -263,9 +265,11 @@ impl BoaEngine {
     /// 二者产生的微任务统一交由调用方随后的 `run_jobs_checked` 排空。
     fn dispatch(&mut self, events: Vec<LoopEvent>) -> Result<(), EngineError> {
         let mut fetches: Vec<FetchResult> = Vec::new();
+        let mut fs_results: Vec<engine_fs::FsResult> = Vec::new();
         for event in events {
             match event {
                 LoopEvent::Fetch(result) => fetches.push(result),
+                LoopEvent::Fs(result) => fs_results.push(result),
                 LoopEvent::Server(inbound) => {
                     engine_http::dispatch_server(inbound, &mut self.context)
                 }
@@ -273,6 +277,9 @@ impl BoaEngine {
         }
         if !fetches.is_empty() {
             engine_fetch::settle(&fetches, &mut self.context);
+        }
+        if !fs_results.is_empty() {
+            engine_fs::settle(fs_results, &mut self.context);
         }
         Ok(())
     }

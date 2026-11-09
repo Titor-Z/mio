@@ -30,6 +30,24 @@ const res = await fetch("https://api.example.com/users", {
 const json = await res.json();
 ```
 
+## 📁 文件操作
+
+```ts
+import * as fs from "@std/fs";
+
+// 便捷读写（全部异步）
+await fs.writeTextFile("a.txt", "hi");
+const text = await fs.readTextFile("a.txt");
+const bytes = await fs.readFile("a.bin");
+const info = await fs.stat("a.txt");          // { isFile, size, ... }
+
+// FD 控制层（分块读写）
+const f = await fs.open("big.bin", "r");     // "r" | "w" | "a"
+const buf = new Uint8Array(64 * 1024);
+const n = await f.read(buf);                  // 读取字节数，0 = EOF
+await f.close();
+```
+
 ## 🛠️ 常用工具
 
 ```ts
