@@ -9,6 +9,14 @@
 //!   生成的 `runtime.c` 提供），不存在运行时探测。
 //! - 入口函数固定为 `main`：链接层面 crt 需要 `int main(void)`，故 `main` 的
 //!   生成签名强制为 `() -> i32`，缺省返回 0。
+//!
+//! 指令选择上的两个优化（TL20261121T210405）：
+//! - 分支语境（if/while/for/三元）的条件若是比较表达式，`icmp`/`fcmp` 的 b1
+//!   结果直传 `brif`，省去 `select` 转 i32；
+//! - 整数字面量作操作数时用立即数变体（`iadd_imm_s` / `imul_imm_s` / `icmp_imm_*`）。
+//!
+//! 借用形态：`builder` 作为独立参数与各函数并列传递（不与 `Ctx` 混装），
+//! 因为 `finalize` 消耗 builder 的所有权，混装会导致借用无法释放。
 
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -27,6 +35,14 @@ type Vars = Vec<(String, Variable)>;
 /// 循环栈：`(continue 目标, break 目标)`，`break`/`continue` 翻译时查表。
 type LoopStack = Vec<(Block, Block)>;
 
+/// 翻译上下文：一帧内共享的可变借用集合（builder 除外，见文件头说明）。
+struct Ctx<'a> {
+    vars: &'a mut Vars,
+    loops: &'a mut LoopStack,
+    program: &'a Program,
+    module: &'a mut cranelift_object::ObjectModule,
+}
+
 /// 代码生成入口：整个程序 → 一个 `ObjectModule`（供 `emit` 产出目标文件）。
 ///
 /// # Errors
@@ -43,7 +59,7 @@ pub fn codegen(program: &Program) -> Result<cranelift_object::ObjectModule, Stri
 fn clif_type(ty: MachineType) -> Type {
     match ty {
         // Cranelift 的整数类型是 sign-agnostic 的：无符号性由指令
-        // （udiv/urem/unsigned IntCC）表达，故 U* 与同名 I* 共用类型。
+        //（udiv/urem/unsigned IntCC）表达，故 U* 与同名 I* 共用类型。
         MachineType::I8 | MachineType::U8 => I8,
         MachineType::I16 | MachineType::U16 => I16,
         MachineType::I32 | MachineType::U32 | MachineType::Bool => I32,
@@ -97,27 +113,25 @@ fn build_function(
     let mut vars: Vars = Vec::new();
     for (index, param) in func.params.iter().enumerate() {
         let var = builder.declare_var(clif_type(param.ty));
-        let _ = index;
         builder.def_var(var, builder.block_params(entry)[index]);
         vars.push((param.name.clone(), var));
     }
 
     let mut loops: LoopStack = Vec::new();
+    let mut cx = Ctx {
+        vars: &mut vars,
+        loops: &mut loops,
+        program,
+        module,
+    };
+
     let mut terminated = false;
     for stmt in &func.body {
         if terminated {
             // return 之后的语句不可达；类型已在 check 阶段校验过，不再翻译。
             break;
         }
-        terminated = translate_stmt(
-            stmt,
-            &mut builder,
-            &mut vars,
-            &mut loops,
-            program,
-            module,
-            is_main,
-        )?;
+        terminated = translate_stmt(stmt, &mut builder, &mut cx, is_main)?;
     }
 
     // 函数体没有显式 return 时，落到帧尾返回零值（void 函数直接返回）。
@@ -152,29 +166,26 @@ fn emit_tail_return(builder: &mut FunctionBuilder, ret: MachineType, is_main: bo
 fn translate_stmt(
     stmt: &Stmt,
     builder: &mut FunctionBuilder,
-    vars: &mut Vars,
-    loops: &mut LoopStack,
-    program: &Program,
-    module: &mut cranelift_object::ObjectModule,
+    cx: &mut Ctx,
     is_main: bool,
 ) -> Result<bool, String> {
     match stmt {
         Stmt::Let { name, ty, init } => {
-            if vars.iter().any(|(n, _)| n == name) {
+            if cx.vars.iter().any(|(n, _)| n == name) {
                 return Err(format!("变量 {name} 重复声明"));
             }
-            let value = translate_expr(init, builder, vars, loops, program, module)?;
+            let value = translate_expr(init, builder, cx)?;
             let var = builder.declare_var(clif_type(*ty));
             builder.def_var(var, value);
-            vars.push((name.clone(), var));
+            cx.vars.push((name.clone(), var));
             Ok(false)
         }
         Stmt::Expr(e) => {
-            translate_expr(e, builder, vars, loops, program, module)?;
+            translate_expr(e, builder, cx)?;
             Ok(false)
         }
         Stmt::If { cond, then, els } => {
-            let condition = translate_expr(cond, builder, vars, loops, program, module)?;
+            let condition = translate_cond(cond, builder, cx)?;
             let then_block = builder.create_block();
             let else_block = builder.create_block();
             let join_block = builder.create_block();
@@ -183,15 +194,14 @@ fn translate_stmt(
                 .brif(condition, then_block, &[], else_block, &[]);
 
             builder.switch_to_block(then_block);
-            let then_terminated =
-                translate_block(then, builder, vars, loops, program, module, is_main)?;
+            let then_terminated = translate_block(then, builder, cx, is_main)?;
             if !then_terminated {
                 builder.ins().jump(join_block, &[]);
             }
 
             builder.switch_to_block(else_block);
             let else_terminated = match els {
-                Some(els) => translate_block(els, builder, vars, loops, program, module, is_main)?,
+                Some(els) => translate_block(els, builder, cx, is_main)?,
                 None => false,
             };
             if !else_terminated {
@@ -212,14 +222,13 @@ fn translate_stmt(
             builder.ins().jump(header, &[]);
             builder.switch_to_block(header);
 
-            let condition = translate_expr(cond, builder, vars, loops, program, module)?;
+            let condition = translate_cond(cond, builder, cx)?;
             builder.ins().brif(condition, body_block, &[], exit, &[]);
 
             builder.switch_to_block(body_block);
-            loops.push((header, exit));
-            let body_terminated =
-                translate_block(body, builder, vars, loops, program, module, is_main)?;
-            loops.pop();
+            cx.loops.push((header, exit));
+            let body_terminated = translate_block(body, builder, cx, is_main)?;
+            cx.loops.pop();
             if !body_terminated {
                 builder.ins().jump(header, &[]);
             }
@@ -238,13 +247,13 @@ fn translate_stmt(
             step,
             body,
         } => {
-            let init_value = translate_expr(init, builder, vars, loops, program, module)?;
-            if vars.iter().any(|(n, _)| n == var) {
+            let init_value = translate_expr(init, builder, cx)?;
+            if cx.vars.iter().any(|(n, _)| n == var) {
                 return Err(format!("循环变量 {var} 重复声明"));
             }
             let loop_var = builder.declare_var(clif_type(*ty));
             builder.def_var(loop_var, init_value);
-            vars.push((var.clone(), loop_var));
+            cx.vars.push((var.clone(), loop_var));
 
             let header = builder.create_block();
             let body_block = builder.create_block();
@@ -253,22 +262,19 @@ fn translate_stmt(
             builder.ins().jump(header, &[]);
             builder.switch_to_block(header);
 
-            let current = builder.use_var(loop_var);
-            let condition = translate_expr(cond, builder, vars, loops, program, module)?;
+            let condition = translate_cond(cond, builder, cx)?;
             builder.ins().brif(condition, body_block, &[], join, &[]);
-            let _ = current;
 
             builder.switch_to_block(body_block);
-            loops.push((step_block, join));
-            let body_terminated =
-                translate_block(body, builder, vars, loops, program, module, is_main)?;
-            loops.pop();
+            cx.loops.push((step_block, join));
+            let body_terminated = translate_block(body, builder, cx, is_main)?;
+            cx.loops.pop();
             if !body_terminated {
                 builder.ins().jump(step_block, &[]);
             }
 
             builder.switch_to_block(step_block);
-            let next = translate_expr(step, builder, vars, loops, program, module)?;
+            let next = translate_expr(step, builder, cx)?;
             builder.def_var(loop_var, next);
             builder.ins().jump(header, &[]);
 
@@ -277,18 +283,17 @@ fn translate_stmt(
             builder.seal_block(body_block);
             builder.seal_block(step_block);
             builder.seal_block(join);
-            vars.pop();
+            cx.vars.pop();
             Ok(false)
         }
         Stmt::Return(e) => {
             match e {
                 Some(e) => {
-                    let value = translate_expr(e, builder, vars, loops, program, module)?;
+                    let value = translate_expr(e, builder, cx)?;
                     if is_main {
                         // main 的生成签名返回 i32 退出码；用户 main 标注 void，忽略返回值。
                         let zero = builder.ins().iconst(I32, 0);
                         builder.ins().return_(&[zero]);
-                        let _ = value;
                     } else {
                         builder.ins().return_(&[value]);
                     }
@@ -312,7 +317,7 @@ fn translate_stmt(
             Ok(true)
         }
         Stmt::Break => {
-            let Some((_, exit)) = loops.last() else {
+            let Some((_, exit)) = cx.loops.last() else {
                 return Err("break 出现在循环外".to_string());
             };
             builder.ins().jump(*exit, &[]);
@@ -325,7 +330,7 @@ fn translate_stmt(
             Ok(true)
         }
         Stmt::Continue => {
-            let Some((header, _)) = loops.last() else {
+            let Some((header, _)) = cx.loops.last() else {
                 return Err("continue 出现在循环外".to_string());
             };
             builder.ins().jump(*header, &[]);
@@ -344,10 +349,7 @@ fn translate_stmt(
 fn translate_block(
     body: &TIRBlock,
     builder: &mut FunctionBuilder,
-    vars: &mut Vars,
-    loops: &mut LoopStack,
-    program: &Program,
-    module: &mut cranelift_object::ObjectModule,
+    cx: &mut Ctx,
     is_main: bool,
 ) -> Result<bool, String> {
     let mut terminated = false;
@@ -355,7 +357,7 @@ fn translate_block(
         if terminated {
             break;
         }
-        terminated = translate_stmt(stmt, builder, vars, loops, program, module, is_main)?;
+        terminated = translate_stmt(stmt, builder, cx, is_main)?;
     }
     Ok(terminated)
 }
@@ -364,10 +366,7 @@ fn translate_block(
 fn translate_expr(
     expr: &Expr,
     builder: &mut FunctionBuilder,
-    vars: &mut Vars,
-    loops: &mut LoopStack,
-    program: &Program,
-    module: &mut cranelift_object::ObjectModule,
+    cx: &mut Ctx,
 ) -> Result<Value, String> {
     match expr {
         Expr::Int { value, ty } => Ok(builder.ins().iconst(clif_type(*ty), *value)),
@@ -377,7 +376,8 @@ fn translate_expr(
         }),
         Expr::Bool(v) => Ok(builder.ins().iconst(I32, i64::from(*v))),
         Expr::Var(name, ty) => {
-            let var = vars
+            let var = cx
+                .vars
                 .iter()
                 .find(|(n, _)| n == name)
                 .map(|(_, v)| *v)
@@ -388,7 +388,7 @@ fn translate_expr(
             Ok(value)
         }
         Expr::UnaryNeg(inner) => {
-            let value = translate_expr(inner, builder, vars, loops, program, module)?;
+            let value = translate_expr(inner, builder, cx)?;
             let ty = builder.func.dfg.value_type(value);
             Ok(if ty.is_float() {
                 builder.ins().fneg(value)
@@ -397,22 +397,18 @@ fn translate_expr(
             })
         }
         Expr::Not(inner) => {
-            let value = translate_expr(inner, builder, vars, loops, program, module)?;
+            let value = translate_expr(inner, builder, cx)?;
             let one = builder.ins().iconst(I32, 1);
             Ok(builder.ins().bxor(value, one))
         }
-        Expr::Binary { op, lhs, rhs, ty } => {
-            let left = translate_expr(lhs, builder, vars, loops, program, module)?;
-            let right = translate_expr(rhs, builder, vars, loops, program, module)?;
-            translate_binary(*op, left, right, *ty, builder)
-        }
+        Expr::Binary { op, lhs, rhs, ty } => translate_binary(*op, lhs, rhs, *ty, builder, cx),
         Expr::Cond {
             cond,
             then,
             els,
             ty,
         } => {
-            let condition = translate_expr(cond, builder, vars, loops, program, module)?;
+            let condition = translate_cond(cond, builder, cx)?;
             let then_block = builder.create_block();
             let else_block = builder.create_block();
             let join = builder.create_block();
@@ -422,11 +418,11 @@ fn translate_expr(
                 .brif(condition, then_block, &[], else_block, &[]);
 
             builder.switch_to_block(then_block);
-            let then_value = translate_expr(then, builder, vars, loops, program, module)?;
+            let then_value = translate_expr(then, builder, cx)?;
             builder.ins().jump(join, &[BlockArg::Value(then_value)]);
 
             builder.switch_to_block(else_block);
-            let else_value = translate_expr(els, builder, vars, loops, program, module)?;
+            let else_value = translate_expr(els, builder, cx)?;
             builder.ins().jump(join, &[BlockArg::Value(else_value)]);
 
             builder.switch_to_block(join);
@@ -436,7 +432,7 @@ fn translate_expr(
             Ok(builder.block_params(join)[0])
         }
         Expr::Cast { value, from, to } => {
-            let inner = translate_expr(value, builder, vars, loops, program, module)?;
+            let inner = translate_expr(value, builder, cx)?;
             Ok(match (from, to) {
                 // 同符号整数扩宽
                 (_, _) if from.is_signed() && to.is_signed() && to.size() > from.size() => {
@@ -450,8 +446,9 @@ fn translate_expr(
             })
         }
         Expr::Assign { name, ty, value } => {
-            let new_value = translate_expr(value, builder, vars, loops, program, module)?;
-            let var = vars
+            let new_value = translate_expr(value, builder, cx)?;
+            let var = cx
+                .vars
                 .iter()
                 .find(|(n, _)| n == name)
                 .map(|(_, v)| *v)
@@ -461,7 +458,7 @@ fn translate_expr(
             Ok(new_value)
         }
         Expr::Call { name, args, ty } => {
-            let value = translate_call(name, args, builder, vars, loops, program, module)?;
+            let value = translate_call(name, args, builder, cx)?;
             // void 调用的结果值是占位 i8，不参与后续消费；此处按 TIR 类型对齐。
             let _ = ty;
             Ok(value)
@@ -469,8 +466,96 @@ fn translate_expr(
     }
 }
 
-/// 二元运算分派：比较出 i32(0/1)，算术按操作数类型原地进行。
+/// 条件语境的翻译：比较表达式直传 b1 给分支指令，省去 select 转换。
+///
+/// 其他表达式（变量、逻辑运算）仍走值层（i32 0/1），`brif` 对两者都接受。
+fn translate_cond(
+    expr: &Expr,
+    builder: &mut FunctionBuilder,
+    cx: &mut Ctx,
+) -> Result<Value, String> {
+    if let Expr::Binary { op, lhs, rhs, ty } = expr
+        && matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        )
+    {
+        let left = translate_expr(lhs, builder, cx)?;
+        let right = translate_expr(rhs, builder, cx)?;
+        return Ok(compare_value(*op, left, right, *ty, builder));
+    }
+    translate_expr(expr, builder, cx)
+}
+
+/// 二元运算翻译（表达式层）：先尝试立即数路径，否则走通用值层。
 fn translate_binary(
+    op: BinOp,
+    lhs_expr: &Expr,
+    rhs_expr: &Expr,
+    ty: MachineType,
+    builder: &mut FunctionBuilder,
+    cx: &mut Ctx,
+) -> Result<Value, String> {
+    // 立即数路径：整数字面量在右侧（全部整数运算），或在左侧且运算可交换。
+    if !ty.is_float() {
+        if let Some(imm) = int_literal(rhs_expr) {
+            let left = translate_expr(lhs_expr, builder, cx)?;
+            return Ok(int_imm_op(builder, op, left, imm, ty));
+        }
+        if matches!(op, BinOp::Add | BinOp::Mul | BinOp::Eq | BinOp::Ne)
+            && let Some(imm) = int_literal(lhs_expr)
+        {
+            let right = translate_expr(rhs_expr, builder, cx)?;
+            return Ok(int_imm_op(builder, op, right, imm, ty));
+        }
+    }
+
+    let left = translate_expr(lhs_expr, builder, cx)?;
+    let right = translate_expr(rhs_expr, builder, cx)?;
+    value_binary(op, left, right, ty, builder)
+}
+
+/// 整数字面量（立即数路径用；浮点无立即数变体，不检测）。
+fn int_literal(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int { value, ty } if ty.is_integer() => Some(*value),
+        _ => None,
+    }
+}
+
+/// 立即数路径的整数运算。比较运算仍转 i32(0/1)，与值层保持一致。
+fn int_imm_op(
+    builder: &mut FunctionBuilder,
+    op: BinOp,
+    left: Value,
+    imm: i64,
+    ty: MachineType,
+) -> Value {
+    let signed = ty.is_signed();
+    match op {
+        BinOp::Add => builder.ins().iadd_imm_s(left, imm),
+        // 减常量 = 加负常量（位模式等价，回绕语义一致）。
+        BinOp::Sub => builder.ins().iadd_imm_s(left, imm.wrapping_neg()),
+        BinOp::Mul => builder.ins().imul_imm_s(left, imm),
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            let cmp = if signed {
+                builder.ins().icmp_imm_s(int_cc(op, signed), left, imm)
+            } else {
+                builder.ins().icmp_imm_u(int_cc(op, signed), left, imm)
+            };
+            let one = builder.ins().iconst(I32, 1);
+            let zero = builder.ins().iconst(I32, 0);
+            builder.ins().select(cmp, one, zero)
+        }
+        // 逻辑/除法/取余无立即数变体（或语义不等价），调用方不会走到这里。
+        BinOp::And | BinOp::Or | BinOp::Div | BinOp::Rem => {
+            unreachable!("立即数路径不覆盖逻辑/除法/取余")
+        }
+    }
+}
+
+/// 值层二元运算（通用路径）。
+fn value_binary(
     op: BinOp,
     left: Value,
     right: Value,
@@ -524,33 +609,7 @@ fn translate_binary(
             }
         }
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-            let cmp = if is_float {
-                let cc = match op {
-                    BinOp::Eq => FloatCC::Equal,
-                    BinOp::Ne => FloatCC::NotEqual,
-                    BinOp::Lt => FloatCC::LessThan,
-                    BinOp::Le => FloatCC::LessThanOrEqual,
-                    BinOp::Gt => FloatCC::GreaterThan,
-                    BinOp::Ge => FloatCC::GreaterThanOrEqual,
-                    _ => unreachable!("比较运算已穷举"),
-                };
-                builder.ins().fcmp(cc, left, right)
-            } else {
-                let cc = match (op, signed) {
-                    (BinOp::Eq, _) => IntCC::Equal,
-                    (BinOp::Ne, _) => IntCC::NotEqual,
-                    (BinOp::Lt, true) => IntCC::SignedLessThan,
-                    (BinOp::Lt, false) => IntCC::UnsignedLessThan,
-                    (BinOp::Le, true) => IntCC::SignedLessThanOrEqual,
-                    (BinOp::Le, false) => IntCC::UnsignedLessThanOrEqual,
-                    (BinOp::Gt, true) => IntCC::SignedGreaterThan,
-                    (BinOp::Gt, false) => IntCC::UnsignedGreaterThan,
-                    (BinOp::Ge, true) => IntCC::SignedGreaterThanOrEqual,
-                    (BinOp::Ge, false) => IntCC::UnsignedGreaterThanOrEqual,
-                    _ => unreachable!("比较运算已穷举"),
-                };
-                builder.ins().icmp(cc, left, right)
-            };
+            let cmp = compare_value(op, left, right, ty, builder);
             // 比较结果是 b1，统一转成 i32(0/1)，与 Bool 的静态表示一致。
             let one = builder.ins().iconst(I32, 1);
             let zero = builder.ins().iconst(I32, 0);
@@ -567,6 +626,47 @@ fn translate_binary(
         }
     };
     Ok(result)
+}
+
+/// 比较运算：返回 b1（分支语境直传；值层再经 select 转 i32）。
+fn compare_value(
+    op: BinOp,
+    left: Value,
+    right: Value,
+    ty: MachineType,
+    builder: &mut FunctionBuilder,
+) -> Value {
+    if ty.is_float() {
+        let cc = match op {
+            BinOp::Eq => FloatCC::Equal,
+            BinOp::Ne => FloatCC::NotEqual,
+            BinOp::Lt => FloatCC::LessThan,
+            BinOp::Le => FloatCC::LessThanOrEqual,
+            BinOp::Gt => FloatCC::GreaterThan,
+            BinOp::Ge => FloatCC::GreaterThanOrEqual,
+            _ => unreachable!("比较运算已穷举"),
+        };
+        builder.ins().fcmp(cc, left, right)
+    } else {
+        builder.ins().icmp(int_cc(op, ty.is_signed()), left, right)
+    }
+}
+
+/// 整数比较的条件码（按符号性分派）。
+fn int_cc(op: BinOp, signed: bool) -> IntCC {
+    match (op, signed) {
+        (BinOp::Eq, _) => IntCC::Equal,
+        (BinOp::Ne, _) => IntCC::NotEqual,
+        (BinOp::Lt, true) => IntCC::SignedLessThan,
+        (BinOp::Lt, false) => IntCC::UnsignedLessThan,
+        (BinOp::Le, true) => IntCC::SignedLessThanOrEqual,
+        (BinOp::Le, false) => IntCC::UnsignedLessThanOrEqual,
+        (BinOp::Gt, true) => IntCC::SignedGreaterThan,
+        (BinOp::Gt, false) => IntCC::UnsignedGreaterThan,
+        (BinOp::Ge, true) => IntCC::SignedGreaterThanOrEqual,
+        (BinOp::Ge, false) => IntCC::UnsignedGreaterThanOrEqual,
+        _ => unreachable!("比较运算已穷举"),
+    }
 }
 
 /// 算术运算的统一入口：整数走 iadd 族，浮点走 fadd 族。
@@ -590,14 +690,11 @@ fn translate_call(
     name: &str,
     args: &[Expr],
     builder: &mut FunctionBuilder,
-    vars: &mut Vars,
-    loops: &mut LoopStack,
-    program: &Program,
-    module: &mut cranelift_object::ObjectModule,
+    cx: &mut Ctx,
 ) -> Result<Value, String> {
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
-        values.push(translate_expr(arg, builder, vars, loops, program, module)?);
+        values.push(translate_expr(arg, builder, cx)?);
     }
 
     if name == builtin::PRINT {
@@ -608,19 +705,21 @@ fn translate_call(
         let Some(symbol) = builtin::print_runtime(type_name(ty)) else {
             return Err(format!("print 不支持类型 {ty:?}"));
         };
-        return emit_runtime_call(builder, module, symbol, &[clif_type(ty)], &values, None);
+        return emit_runtime_call(cx, builder, symbol, &[clif_type(ty)], &values);
     }
 
     // 用户函数：同模块内直接 call。
-    let callee = program
+    let callee = cx
+        .program
         .functions
         .iter()
         .find(|f| f.name == name)
         .ok_or_else(|| format!("函数 {name} 未声明"))?;
-    let callee_id = module
+    let callee_id = cx
+        .module
         .declare_function(&callee.name, Linkage::Local, &signature(callee))
         .map_err(|error| format!("声明函数 {name} 失败：{error}"))?;
-    let fref = module.declare_func_in_func(callee_id, builder.func);
+    let fref = cx.module.declare_func_in_func(callee_id, builder.func);
     let sig = signature(callee);
     let call = builder.ins().call(fref, &values);
     let results = builder.inst_results(call);
@@ -635,24 +734,21 @@ fn translate_call(
 
 /// 调用一个运行时导入函数（`runtime.c` 提供），返回第一个结果（无结果时给 i8 零值）。
 fn emit_runtime_call(
+    cx: &mut Ctx,
     builder: &mut FunctionBuilder,
-    module: &mut cranelift_object::ObjectModule,
     symbol: &str,
     param_types: &[Type],
     args: &[Value],
-    ret: Option<Type>,
 ) -> Result<Value, String> {
     let mut sig = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
     for ty in param_types {
         sig.params.push(AbiParam::new(*ty));
     }
-    if let Some(ret) = ret {
-        sig.returns.push(AbiParam::new(ret));
-    }
-    let func_id = module
+    let func_id = cx
+        .module
         .declare_function(symbol, Linkage::Import, &sig)
         .map_err(|error| format!("声明运行时函数 {symbol} 失败：{error}"))?;
-    let fref = module.declare_func_in_func(func_id, builder.func);
+    let fref = cx.module.declare_func_in_func(func_id, builder.func);
     let call = builder.ins().call(fref, args);
     let results = builder.inst_results(call);
     Ok(results
