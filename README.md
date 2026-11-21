@@ -1,6 +1,6 @@
 # mio
 
-TypeScript 一等公民的运行时。TypeScript 源文件直接作为输入语言，运行时内部完成类型擦除与执行。
+TypeScript 一等公民的运行时。TypeScript 源文件直接作为输入语言，不做 JavaScript 转译：阶段 A 内部完成类型擦除与执行，阶段 B 直接编译为本机机器码。
 不提供 Node.js / CommonJS / `node_modules` 兼容层，也不解析 `package.json` 入口。
 
 ## 定位
@@ -11,14 +11,26 @@ TypeScript 一等公民的运行时。TypeScript 源文件直接作为输入语�
 | 模块体系 | 纯 ES Module；相对路径、绝对路径、`file:` URL、`imports` 映射、`@std/*` 内建命名空间 |
 | 包管理 | 无。不查找 `node_modules`，不支持裸包名 |
 | 标准库 | Web 标准库（全局对象）+ `@std/*`（模块导入） |
-| 类型处理 | 类型注解与类型声明在编译期擦除；`enum` / `namespace` / 参数属性降级为等价 JavaScript |
+| 类型处理 | 阶段 A：类型注解在编译期擦除；阶段 B：类型参与代码生成，内存布局在编译期确定 |
+| 执行形态 | 阶段 A：Boa 引擎；阶段 B：AOT 编译为原生可执行文件（Cranelift 代码生成） |
 
 ## 两阶段路线
 
-- **阶段 A（当前）**：TypeScript 源码 → 类型擦除 → 执行。转译由 OXC 承担，执行由 Boa 承担，两者分别隔离在 `transpiler` 与 `engine` 模块内。
-- **阶段 B（预留）**：自研词法、语法、语义与字节码虚拟机，直接消费类型信息并输出原生代码。
+- **阶段 A（当前）**：TypeScript 源码 → 类型擦除 → 执行。转译由 OXC 承担，执行由 Boa 承担，两者分别隔离在 `transpiler` 与 `engine` 模块内。此阶段是脚手架，不是最终形态。
+- **阶段 B（预留）**：自研词法、语法、语义与代码生成，直接消费类型信息，AOT 编译为本机机器码（Cranelift）。产出原生可执行文件，全程不经 JavaScript 引擎。
 
-两阶段之间只保留两个接缝：`engine::Engine` 抽象与 `resolver::Specifier` 分类。其余模块在两个阶段之间复用。
+两阶段之间只保留两个接缝：`engine::Engine` 抽象与 `resolver::Specifier` 分类。其余模块在两阶段之间复用（`@std/*` 核心逻辑为纯 Rust，只需替换最外层绑定层）。
+
+阶段 B 的原生后端 MVP 已落地于 `native/`（独立 workspace，与根 crate 零耦合）：`mio-native build app.ts -o app` 把 TypeScript 子集 AOT 编译为本机可执行文件（OXC → TIR → Cranelift → `cc` 链接）。验收数字与已知边界见 `docs/NativeMVP报告.md`。
+
+阶段 B 的语法与语义决策集中于 `docs/语法讨论书.md`，那是本项目的唯一权威设计文件。要点：
+
+- **语法零改动**：不新增关键字或语法形式，机器类型（`i32`/`f64` 等）以类型名形式追加，通过内置类型声明提供。
+- **表示决策表**：每个类型在编译期必须被判定为 `POD` 或 `GcRef` 两类表示之一；判不出即编译期报错，禁止隐式装箱。
+- **安全承诺**：健全性（`as` 仅限可证明安全的转换；位重解释走 `unsafeCast<T>()` 函数，`--deny-unsafe` 可整体移除）、无未定义行为、确定性、可审计。数值收窄必须指名语义（`trunc` / `wrap` / `sat`）。
+- **内存管理**：自动 GC（bump allocator → 精确 mark-sweep → 分代）。
+- **性能定位**：接近 C，优于 Go；不追求 Rust 档。
+- **非目标**：无 GC 模式、嵌入式、所有权/借用检查、`node_modules` 兼容、JIT。
 
 ## 构建
 

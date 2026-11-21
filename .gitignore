@@ -25,3 +25,6 @@ docs/Taolun.md
 
 # 站点依赖（dist/ 需要提交，供二进制内嵌）
 site/node_modules/
+
+# native 是独立 workspace，其构建产物不入库
+/native/target

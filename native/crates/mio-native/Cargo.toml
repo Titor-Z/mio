@@ -1,0 +1,28 @@
+[package]
+name = "mio-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# mio 原生后端的独立入口。阶段 A 的 `mio` binary 不依赖本 crate。
+[[bin]]
+name = "mio-native"
+path = "src/main.rs"
+
+[dependencies]
+# TypeScript 前端：与根 crate 同版本（OXC 0.156），保证 AST 形态一致。
+oxc_allocator = "0.156"
+oxc_ast = "0.156"
+oxc_parser = "0.156"
+oxc_span = "0.156"
+
+# AOT 后端：IR 构造 + 目标文件产出。
+cranelift-codegen = "0.137"
+cranelift-frontend = "0.137"
+cranelift-module = "0.137"
+cranelift-object = "0.137"
+target-lexicon = "0.13"
+
+[lints]
+workspace = true
