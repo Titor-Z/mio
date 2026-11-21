@@ -22,6 +22,7 @@ pub struct Program {
     pub functions: Vec<Func>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Func {
     pub name: String,
     pub params: Vec<Param>,
@@ -29,6 +30,7 @@ pub struct Func {
     pub body: Block,
 }
 
+#[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
     pub ty: MachineType,

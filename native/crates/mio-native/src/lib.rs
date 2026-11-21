@@ -9,6 +9,7 @@ mod builtin;
 mod check;
 mod codegen;
 mod emit;
+mod inline;
 mod lower;
 mod repr;
 mod types;
@@ -28,6 +29,7 @@ pub fn compile_file(src_path: &str, out_path: &Path, emit_obj_only: bool) -> Res
         std::fs::read_to_string(src_path).map_err(|e| format!("读取 {src_path} 失败：{e}"))?;
     let program = lower::lower(&src)?;
     check::check(&program)?;
+    let program = inline::inline(program);
     let module = codegen::codegen(&program)?;
     emit::emit(module, src_path, out_path, emit_obj_only)
 }

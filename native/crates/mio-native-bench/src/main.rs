@@ -55,6 +55,24 @@ const CASES: &[Case] = &[
         js: "let sum = 0; for (let i = 0; i < 100000000; i = i + 1) sum = sum + i; console.log(sum);\n",
     },
     Case {
+        name: "loop 1e8 call",
+        ts: "function add(a: i64, b: i64): i64 {\n\
+             \x20 return a + b;\n\
+             }\n\
+             function main(): void {\n\
+             \x20 let sum: i64 = 0;\n\
+             \x20 for (let i: i64 = 0; i < 100000000; i = i + 1) {\n\
+             \x20   sum = add(sum, i);\n\
+             \x20 }\n\
+             \x20 print(sum);\n\
+             }\n",
+        c: "#include <stdio.h>\n\
+            static inline long long add(long long a, long long b) { return a + b; }\n\
+            int main() { long long sum = 0; for (long long i = 0; i < 100000000; i = i + 1) sum = add(sum, i); printf(\"%lld\\n\", sum); return 0; }\n",
+        js: "function add(a, b) { return a + b; }\n\
+             let sum = 0; for (let i = 0; i < 100000000; i = i + 1) sum = add(sum, i); console.log(sum);\n",
+    },
+    Case {
         name: "loop 1e8 float",
         ts: "function main(): void {\n\
              \x20 let acc: f64 = 0.0;\n\

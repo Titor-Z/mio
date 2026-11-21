@@ -108,6 +108,32 @@ pub const CASES: &[(&str, &str, &str)] = &[
          }\n",
         "-3\n-1\n3\n1\n",
     ),
+    // 小函数内联：循环内调用 add（内联后应与手工展开版同输出）。
+    (
+        "inline-loop",
+        "function add(a: i64, b: i64): i64 {\n\
+         \x20 return a + b;\n\
+         }\n\
+         function main(): void {\n\
+         \x20 let sum: i64 = 0;\n\
+         \x20 for (let i: i64 = 0; i < 100; i = i + 1) {\n\
+         \x20   sum = add(sum, i);\n\
+         \x20 }\n\
+         \x20 print(sum);\n\
+         }\n",
+        "4950\n",
+    ),
+    // 嵌套语境（print 的实参是调用）不展开，函数定义保留，输出不变。
+    (
+        "inline-nested-kept",
+        "function add(a: i32, b: i32): i32 {\n\
+         \x20 return a + b;\n\
+         }\n\
+         function main(): void {\n\
+         \x20 print(add(40, 2));\n\
+         }\n",
+        "42\n",
+    ),
 ];
 
 /// 应当被拒绝的源码与错误关键字。
