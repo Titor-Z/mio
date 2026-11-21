@@ -7,6 +7,28 @@ TodoID 规则：`TD` + UUID。TaolunID 规则：`TL` + `YYYYMMDDThhmmss`。
 
 ---
 
+## 0.5.0（2026-11-22）
+
+**状态**：已发布。
+
+**更新内容**
+
+- `mio build` 支持多文件 `import`（相对路径、扩展名可省、具名导入；循环导入解析期检出；裸包名/别名/默认与命名空间导入明确报错）。
+- `mio build` 的语法 desugar：`switch`（穿透）、`do-while`、复合赋值（`+= -= *= /= %=`）。
+- 修复零周期 `setInterval` 在超时边界的假红竞态（约 1/3 概率误报「微任务队列未能排空」）：超时报错加「无未决宿主工作」条件，风暴诊断保留。
+
+**TodoLists[]**
+
+- TD89f5bfffd00142c1860e76121ae1ca7c（多文件 import 与 desugar）
+- TDbbd019102ed44d07b9783ae4d2d9d20e（零周期 interval 超时边界假红修复）
+
+**关联讨论**
+
+- TL20261122T033801（多文件 import 与 desugar）
+- TL20261122T034805（flake 修复）
+
+---
+
 ## 0.4.0（2026-11-22）
 
 **状态**：已发布。

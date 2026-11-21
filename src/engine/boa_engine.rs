@@ -311,10 +311,17 @@ impl BoaEngine {
     }
 
     /// 排空微任务，并检查这次排空是否被看门狗中止过——微任务风暴的唯一出口。
+    ///
+    /// 报错条件除「预算被掐断」外还要求**没有未决的宿主工作**（fetch / fs /
+    /// server / 定时器任一）：零周期 interval 等正常轮次也会恰好跨过 deadline
+    /// （看门狗已按键、`expired` 永久置位），此时事件循环仍有工作可收尾，
+    /// 应统一由外层的 `finish_with_timeout` 优雅终局，而不是在这里把
+    /// 「正常终局边界」误报为「微任务风暴」（这是零周期 interval 用例
+    /// ~1/3 概率假红的根因）。
     fn run_jobs_checked(&mut self) -> Result<(), EngineError> {
         self.run_jobs()?;
         let expired = self.budget.as_ref().is_some_and(|budget| budget.expired());
-        if expired {
+        if expired && !self.has_pending_work() {
             return Err(EngineError::new(
                 "事件循环",
                 format!(
@@ -324,6 +331,15 @@ impl BoaEngine {
             ));
         }
         Ok(())
+    }
+
+    /// 是否有未决的宿主工作（fetch / fs / server / 定时器任一）。
+    fn has_pending_work(&self) -> bool {
+        engine_fetch::has_pending()
+            || engine_fs::has_pending()
+            || engine_http::is_listening()
+            || engine_http::has_pending()
+            || engine_timers::next_deadline().is_some()
     }
 
     /// 触发到期定时器并排空随后的微任务；错误经源码映射包装为引擎错误。
