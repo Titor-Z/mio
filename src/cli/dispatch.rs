@@ -81,13 +81,21 @@ fn build_file(path: &std::path::Path, out: Option<&std::path::Path>, emit_obj: b
     }
     #[cfg(feature = "native")]
     {
+        // 先读源码：编译期错误要渲染源码行与插入符，需要原文。
+        let src = std::fs::read_to_string(path)
+            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
         let out_path =
             out.map_or_else(|| default_artifact_path(path), std::path::Path::to_path_buf);
-        mio_native::compile_file(&path.to_string_lossy(), &out_path, emit_obj)?;
-        if !emit_obj {
-            println!("已生成 {}", out_path.display());
+        match mio_native::compile_source(&src, &path.to_string_lossy(), &out_path, emit_obj) {
+            Ok(()) => {
+                if !emit_obj {
+                    println!("已生成 {}", out_path.display());
+                }
+                Ok(())
+            }
+            // 多行诊断块原样返回（首行由 main 统一加 `mio: ` 前缀）。
+            Err(e) => Err(e.render(Some(&src))),
         }
-        Ok(())
     }
 }
 

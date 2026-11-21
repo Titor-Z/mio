@@ -48,7 +48,7 @@ struct Ctx<'a> {
 /// # Errors
 /// 遇到无法映射到 Cranelift 指令的节点即返回 `Err`。
 pub fn codegen(program: &Program) -> Result<cranelift_object::ObjectModule, String> {
-    let mut module = crate::emit::new_module()?;
+    let mut module = crate::emit::new_module().map_err(|e| e.to_string())?;
     for func in &program.functions {
         build_function(func, program, &mut module)?;
     }

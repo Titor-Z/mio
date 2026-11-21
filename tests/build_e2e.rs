@@ -145,6 +145,49 @@ fn unsupported_syntax_reports_stage_name() {
 }
 
 #[test]
+fn lower_error_renders_line_column_and_caret() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("{reason}");
+        return;
+    }
+    let dir = workspace("diag_lower");
+    // 缺类型标注：lower 期错误，应精确到行列并渲染插入符。
+    write(
+        &dir,
+        "bad.ts",
+        "function main(): void {\n  const s = \"hi\";\n}\n",
+    );
+
+    let build = run_mio(&dir, &["build", "bad.ts", "-o", "bad"]);
+    let text = combined(&build);
+    assert!(!build.status.success(), "应失败：{text}");
+    assert!(text.contains("bad.ts:2:9"), "应定位到行列：{text}");
+    assert!(text.contains("类型标注"), "消息应说明原因：{text}");
+    assert!(text.contains('^'), "应渲染插入符：{text}");
+}
+
+#[test]
+fn check_error_points_to_function_declaration_line() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("{reason}");
+        return;
+    }
+    let dir = workspace("diag_check");
+    // `as` 缩窄不在白名单：check 期错误，TIR 无 span，定位到函数声明行。
+    write(
+        &dir,
+        "bad3.ts",
+        "function main(): void {\n  let a: i32 = 1;\n  let b: i32 = a as i8;\n}\n",
+    );
+
+    let build = run_mio(&dir, &["build", "bad3.ts", "-o", "bad3"]);
+    let text = combined(&build);
+    assert!(!build.status.success(), "应失败：{text}");
+    assert!(text.contains("bad3.ts:1:1"), "应定位到函数声明行：{text}");
+    assert!(text.contains("不在白名单"), "消息应说明原因：{text}");
+}
+
+#[test]
 fn build_only_options_rejected_on_other_commands() {
     let dir = workspace("bad_flag");
     let output = run_mio(&dir, &["run", "app.ts", "-o", "x"]);

@@ -3,9 +3,12 @@
 //! 运行时约定：用户代码调用的 `mio_print_*` 由本模块生成的 `runtime.c` 提供，
 //! 与用户 `.o` 一起交给 `cc` 链接。`--emit-obj` 时只产 `.o`（不写 runtime.c、
 //! 不链接），供人工检查 Cranelift 产出。
+//!
+//! 错误统一为 [`BuildError`]：写盘期标 `Emit`，`cc` 相关标 `Link`（多见于宿主环境）。
 
 use std::path::Path;
 
+use crate::diag::{BuildError, Stage};
 use cranelift_codegen::isa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_object::ObjectModule;
@@ -33,23 +36,25 @@ void mio_print_bool(int v) { printf("%s\n", v ? "true" : "false"); }
 ///
 /// # Errors
 /// 目标三元组不受支持或 flag 非法时返回 `Err`。
-pub fn new_module() -> Result<ObjectModule, String> {
+pub fn new_module() -> Result<ObjectModule, BuildError> {
     let mut flag_builder = settings::builder();
-    flag_builder
-        .set("opt_level", "speed")
-        .map_err(|error| format!("设置 opt_level 失败：{error}"))?;
+    flag_builder.set("opt_level", "speed").map_err(|error| {
+        BuildError::new(Stage::Emit, "", format!("设置 opt_level 失败：{error}"))
+    })?;
     let flags = settings::Flags::new(flag_builder);
-    // 宿主完整 triple：决定目标文件格式（Mach-O/ELF/COFF），仅按架构名会落到 ELF。
+    // 宿主完整 triple：决定目标文件格式（Mach-O/ELF/COFF），仅按架构名会落 ELF。
     let isa = isa::lookup(Triple::host())
-        .map_err(|error| format!("本机目标不可用：{error}"))?
+        .map_err(|error| BuildError::new(Stage::Emit, "", format!("本机目标不可用：{error}")))?
         .finish(flags)
-        .map_err(|error| format!("构建目标 ISA 失败：{error}"))?;
+        .map_err(|error| BuildError::new(Stage::Emit, "", format!("构建目标 ISA 失败：{error}")))?;
     let builder = cranelift_object::ObjectBuilder::new(
         isa,
         "mio-native",
         cranelift_module::default_libcall_names(),
     )
-    .map_err(|error| format!("创建 ObjectBuilder 失败：{error}"))?;
+    .map_err(|error| {
+        BuildError::new(Stage::Emit, "", format!("创建 ObjectBuilder 失败：{error}"))
+    })?;
     Ok(ObjectModule::new(builder))
 }
 
@@ -62,15 +67,24 @@ pub fn emit(
     src_path: &str,
     out_path: &Path,
     emit_obj_only: bool,
-) -> Result<(), String> {
+) -> Result<(), BuildError> {
     let product = module.finish();
-    let bytes = product
-        .emit()
-        .map_err(|error| format!("目标文件序列化失败：{error}"))?;
+    let bytes = product.emit().map_err(|error| {
+        BuildError::new(
+            Stage::Emit,
+            src_path,
+            format!("目标文件序列化失败：{error}"),
+        )
+    })?;
 
     let obj_path = out_path.with_extension("o");
-    std::fs::write(&obj_path, &bytes)
-        .map_err(|error| format!("写 {} 失败：{error}", obj_path.display()))?;
+    std::fs::write(&obj_path, &bytes).map_err(|error| {
+        BuildError::new(
+            Stage::Emit,
+            src_path,
+            format!("写 {} 失败：{error}", obj_path.display()),
+        )
+    })?;
 
     if emit_obj_only {
         println!("已产出目标文件：{}", obj_path.display());
@@ -79,8 +93,13 @@ pub fn emit(
 
     // runtime.c 与 .o 同目录，链接后即删，保持项目目录干净。
     let runtime_path = obj_path.with_extension("runtime.c");
-    std::fs::write(&runtime_path, RUNTIME_C)
-        .map_err(|error| format!("写 {} 失败：{error}", runtime_path.display()))?;
+    std::fs::write(&runtime_path, RUNTIME_C).map_err(|error| {
+        BuildError::new(
+            Stage::Emit,
+            src_path,
+            format!("写 {} 失败：{error}", runtime_path.display()),
+        )
+    })?;
 
     let output = std::process::Command::new("cc")
         .arg("-o")
@@ -88,21 +107,24 @@ pub fn emit(
         .arg(&obj_path)
         .arg(&runtime_path)
         .output()
-        .map_err(|error| format!("无法启动 cc：{error}"))?;
+        .map_err(|error| BuildError::new(Stage::Link, src_path, format!("无法启动 cc：{error}")))?;
 
     // 无论链接成败都清理中间产物；失败时把 cc 的原始输出带给用户。
     let _ = std::fs::remove_file(&runtime_path);
     if !output.status.success() {
         let _ = std::fs::remove_file(&obj_path);
-        return Err(format!(
-            "cc 链接失败（可手工执行：cc -o {} {} runtime.c）：\n{}",
-            out_path.display(),
-            obj_path.display(),
-            String::from_utf8_lossy(&output.stderr)
+        return Err(BuildError::new(
+            Stage::Link,
+            src_path,
+            format!(
+                "cc 链接失败（可手工执行：cc -o {} {} runtime.c）：\n{}",
+                out_path.display(),
+                obj_path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ),
         ));
     }
 
     let _ = std::fs::remove_file(&obj_path);
-    let _ = src_path;
     Ok(())
 }

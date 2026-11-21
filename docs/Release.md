@@ -7,6 +7,34 @@ TodoID 规则：`TD` + UUID。TaolunID 规则：`TL` + `YYYYMMDDThhmmss`。
 
 ---
 
+## 0.4.0（2026-11-22）
+
+**状态**：已发布。
+
+**更新内容**
+
+- 新增 `mio build`：TypeScript 子集 → 本机可执行文件（阶段 B 原生后端收编为主 CLI 子命令，独立模块 + feature `native` 门控，默认开启）。
+- 原生后端诊断结构化（`BuildError`）：降低期错误精确到行列；类型检查期错误定位到函数声明行；渲染为 rustc 风格源码块。
+- 原生后端小函数内联扩展到带控制流的函数（if/while/for/提前 return；拒绝循环体内的 return）。
+- 手册新增「编译为原生可执行文件」章节与速查表条目；README 阶段 B 段改为 `mio build`。
+
+**TodoLists[]**
+
+- TD77d5bb566833497dbaa31d564bd0cde1（原生后端 MVP 主体）
+- TDcddc66028ced4bd09874cedea8ad7ffc（MVP 语义层）
+- TDa5354d28435a4e17a08f30e041173b5d（MVP 代码生成）
+- TD085d68ae63a249f98e3ba0b012ca74f2（MVP 基准与报告）
+- TDd15b8d585eae461c90471ebfc41c1692（Native 性能优化轮）
+- TD5dfa47f778e14af9bd8756b5ac1279bb（mio build 收编与诊断改进）
+
+**关联讨论**
+
+- TL20261110T041429（原生后端立项）
+- TL20261121T210405（性能优化轮）
+- TL20261122T022000（诊断精度与 build 收编）
+
+---
+
 ## 0.3.0（2026-11-21）
 
 **状态**：已发布。

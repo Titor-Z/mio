@@ -3,6 +3,21 @@
 本文件只保留最新一个版本的发布说明，供 GitHub Actions 生成 release 使用。
 历史版本记录见 `docs/Release.md`。
 
+## 0.4.0
+
+### 新增：`mio build`——编译为原生可执行文件（阶段 B 收编为可选模块）
+
+- 新增 `mio build <file> [-o out] [--emit-obj]`：把带类型标注的 TypeScript 子集 AOT 编译为本机可执行文件（OXC → TIR → Cranelift → `cc` 链接），不经 JavaScript 引擎。
+- 原生后端作为**独立可选模块**接入：`native/` 仍是独立 workspace，主 crate 单向依赖它（与 `tsrs_execute` 同一模式）；由 cargo feature `native` 门控，默认开启，`cargo build --no-default-features` 产出的瘦 binary 不含 Cranelift，`mio build` 会给出明确提示而非静默失效。
+- 运行时（`mio run`）不受影响：类型仍擦除执行，不强制类型标注。
+- 诊断改进：编译错误带阶段名与位置——降低期错误精确到行列，类型检查期错误定位到函数声明行，渲染为 rustc 风格（源码行 + 插入符）。
+
+### 性能（阶段 B 实测，release，macOS x86_64）
+
+- `fib(35)`：mio 0.07s / Node 0.24s / cc 0.03s（3.3x Node）。
+- 热点循环 1e8 次：小函数内联（本次扩展到带 if/提前 return 的函数）后 0.20s → 0.07s，与手工内联持平；浮点循环与 cc 持平。
+- 已知边界：支持机器类型与纯计算子集；字符串/数组/对象/闭包/`import` 暂不支持（显式报错）。数字与边界见 `docs/NativeMVP报告.md`。
+
 ## 0.3.0
 
 ### 标准库补齐：`@std/os` / `@std/env` / `@std/encoding` / `@std/log`

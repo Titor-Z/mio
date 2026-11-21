@@ -55,8 +55,9 @@ fn rejected_sources_fail_with_keyword() {
             Ok(()) => panic!("用例 {tag} 应编译失败（预期被拒绝）"),
             Err(error) => error,
         };
+        // BuildError 的 Display 保留原始消息文本，关键词断言不变。
         assert!(
-            error.contains(keyword),
+            error.to_string().contains(keyword),
             "用例 {tag} 的错误应含 `{keyword}`，实际：{error}"
         );
 

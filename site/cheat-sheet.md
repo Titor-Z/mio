@@ -153,3 +153,19 @@ const headers = new Headers();
 headers.set("Access-Control-Allow-Origin", "*");
 return new Response(data, { headers });
 ```
+
+## ⚡ 编译为原生可执行文件
+
+```bash
+mio build app.ts            # 产出本机可执行文件 app
+mio build app.ts -o fib     # 指定产物名
+mio build app.ts --emit-obj # 只产 .o，不链接
+```
+
+```ts
+function add(a: i64, b: i64): i64 { return a + b; }  // 必须带类型标注
+function main(): void { print(add(1, 2)); }          // 入口固定 main
+```
+
+支持：机器类型（`i8..i64`/`u8..u64`/`f32`/`f64`/`bool`）、`if`/`while`/`for`、三元、`as` 扩宽、`print`。
+不支持：字符串、数组、对象、`class`、闭包、`import`、`switch`、复合赋值——需要时用 `mio run`。

@@ -21,7 +21,7 @@ TypeScript 一等公民的运行时。TypeScript 源文件直接作为输入语�
 
 两阶段之间只保留两个接缝：`engine::Engine` 抽象与 `resolver::Specifier` 分类。其余模块在两阶段之间复用（`@std/*` 核心逻辑为纯 Rust，只需替换最外层绑定层）。
 
-阶段 B 的原生后端 MVP 已落地于 `native/`（独立 workspace，与根 crate 零耦合）：`mio-native build app.ts -o app` 把 TypeScript 子集 AOT 编译为本机可执行文件（OXC → TIR → Cranelift → `cc` 链接）。验收数字与已知边界见 `docs/NativeMVP报告.md`。
+阶段 B 的原生后端 MVP 已落地于 `native/`（独立 workspace，与根 crate 单向耦合）：`mio build app.ts -o app` 把 TypeScript 子集 AOT 编译为本机可执行文件（OXC → TIR → Cranelift → `cc` 链接），由 feature `native` 门控（默认开启，`--no-default-features` 可关闭）。验收数字与已知边界见 `docs/NativeMVP报告.md`。
 
 阶段 B 的语法与语义决策集中于 `docs/语法讨论书.md`，那是本项目的唯一权威设计文件。要点：
 
@@ -50,6 +50,7 @@ mio run app.ts         # 执行 TypeScript 文件
 mio eval "..."         # 执行内联源码
 mio repl               # 交互式求值
 mio check app.ts       # 仅类型检查（内置 tsrs 编译器）
+mio build app.ts       # 编译为原生可执行文件（阶段 B，TS 子集）
 mio task <name>        # 执行 mio.json 声明的任务
 mio init               # 初始化项目（含编辑器类型声明）
 mio types              # 刷新 .mio/@types/ 下的类型声明

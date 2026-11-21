@@ -36,6 +36,8 @@ use crate::types::MachineType;
 /// check 阶段保证，副本只是复制）。
 #[must_use]
 pub fn inline(mut program: Program) -> Program {
+    // 路径随程序贯穿各阶段（诊断定位用），先取出再重建。
+    let path = std::mem::take(&mut program.path);
     // 第一遍：收集可内联函数的定义（克隆出来，避免与 functions 的消费遍历冲突）。
     let defs: HashMap<String, Func> = program
         .functions
@@ -60,6 +62,7 @@ pub fn inline(mut program: Program) -> Program {
                 name: func.name,
                 params: func.params,
                 ret: func.ret,
+                line: func.line,
                 body,
             });
         }
@@ -75,7 +78,7 @@ pub fn inline(mut program: Program) -> Program {
         }
     }
 
-    Program { functions }
+    Program { functions, path }
 }
 
 /// 可内联判定：叶子小函数，允许控制流，拒绝循环体内的 return。
@@ -539,6 +542,7 @@ mod tests {
                 ty: MachineType::I32,
             }],
             ret: MachineType::I32,
+            line: 1,
             body: vec![Stmt::Return(Some(Expr::Binary {
                 op: BinOp::Add,
                 lhs: Box::new(Expr::Var(String::from("a"), MachineType::I32)),
@@ -560,6 +564,7 @@ mod tests {
                 ty: MachineType::I64,
             }],
             ret: MachineType::I64,
+            line: 1,
             body: vec![
                 Stmt::If {
                     cond: Expr::Binary {
@@ -587,6 +592,7 @@ mod tests {
             name: String::from("main"),
             params: vec![],
             ret: MachineType::Void,
+            line: 1,
             body,
         }
     }
@@ -594,6 +600,7 @@ mod tests {
     #[test]
     fn inline_expands_let_call_and_renames_locals() {
         let program = Program {
+            path: String::new(),
             functions: vec![
                 helper("inc"),
                 main_with(vec![Stmt::Let {
@@ -632,6 +639,7 @@ mod tests {
     #[test]
     fn control_flow_function_is_inlined_with_wrapper_loop() {
         let program = Program {
+            path: String::new(),
             functions: vec![
                 abs_helper(),
                 main_with(vec![Stmt::Let {
@@ -671,6 +679,7 @@ mod tests {
     fn recursive_function_is_not_inlined() {
         // fib 体内有 Call，不可内联。
         let program = Program {
+            path: String::new(),
             functions: vec![
                 Func {
                     name: String::from("fib"),
@@ -679,6 +688,7 @@ mod tests {
                         ty: MachineType::I64,
                     }],
                     ret: MachineType::I64,
+                    line: 1,
                     body: vec![Stmt::Return(Some(Expr::Call {
                         name: String::from("fib"),
                         args: vec![Expr::Int {
@@ -699,6 +709,7 @@ mod tests {
     fn return_inside_loop_is_not_inlined() {
         // 循环体内的 return 无法保持语义（break 会绑定到内层循环），拒绝内联。
         let program = Program {
+            path: String::new(),
             functions: vec![
                 Func {
                     name: String::from("search"),
@@ -707,6 +718,7 @@ mod tests {
                         ty: MachineType::I64,
                     }],
                     ret: MachineType::I64,
+                    line: 1,
                     body: vec![
                         Stmt::While {
                             cond: Expr::Bool(true),
@@ -733,6 +745,7 @@ mod tests {
     fn nested_block_contexts_are_rewritten() {
         // if 体内的调用也应展开。
         let program = Program {
+            path: String::new(),
             functions: vec![
                 helper("inc"),
                 main_with(vec![Stmt::If {

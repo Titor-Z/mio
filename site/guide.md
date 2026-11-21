@@ -409,6 +409,52 @@ A: 先确认已执行 `mio init`，并且 `tsconfig.json` 里有：
 
 A: 运行 `mio check yourfile.ts` 会进行类型检查，如果有类型错误会报错。
 
+## 8. 编译为原生可执行文件（阶段 B）
+
+`mio build` 把带类型标注的 TypeScript 子集直接编译成本机机器码（OXC → TIR → Cranelift → `cc` 链接），产物不经任何 JavaScript 引擎。它是**可选模块**：关掉它（`cargo build --no-default-features`）后 `mio` 退回纯运行时，其余命令不受影响。
+
+```bash
+mio build app.ts          # 产物为同目录同名的 app
+mio build app.ts -o fib   # 指定产物路径
+mio build app.ts --emit-obj   # 只产目标文件 .o，不链接
+```
+
+```ts
+// app.ts
+function fib(n: i64): i64 {
+  if (n < 2) {
+    return n;
+  }
+  return fib(n - 1) + fib(n - 2);
+}
+function main(): void {
+  print(fib(20));   // 6765
+}
+```
+
+**支持的语言面**（子集之外的形态一律编译期报错，不静默降级）：
+
+- 类型：`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`/`f32`/`f64`/`bool`/`number`（= `f64`）/`void`
+- 语句：函数声明、`let`（必须带类型标注与初始化式）、`if`/`else if`、`while`、`for`（三段式）、`break`/`continue`/`return`
+- 表达式：整数与浮点字面量、布尔、变量、四则与比较、`&&`/`||`、三元、`as` 扩宽断言（同符号整数扩宽与 `f32→f64`）、赋值、自增自减、函数调用
+- 内置：`print`（按参数静态类型分派，整数/浮点/布尔均可）
+
+**暂不支持**：字符串、数组、对象、`class`、泛型、闭包与箭头函数、`import`（单文件编译）、`switch`、复合赋值（`+=` 等，请展开写）。需要这些时用 `mio run` 执行。
+
+**与 `mio run` 的语义差异**：编译期判定每个值的机器类型，无隐式转换；整数溢出按回绕处理（与 C 一致）；`&&`/`||` 是位运算而非短路（子集内表达式无副作用，二者等价）。
+
+**错误诊断**：lower 期错误（不支持的语法、缺类型标注、字面量越界）精确到行列；类型检查期错误定位到函数声明行：
+
+```
+mio: error: 变量 s 必须有类型标注
+ --> app.ts:2:9
+  |
+2 |   const s = "hi";
+            ^
+```
+
+已知边界与性能数字（fib(35) 为 Node 的 3.3 倍）见 `docs/NativeMVP报告.md`。
+
 ## 下一步
 
 - 查看 [兼容性文档](./compatibility.md) 了解与 Node.js/Deno 的差异

@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "boa_engine",
  "boa_gc",
