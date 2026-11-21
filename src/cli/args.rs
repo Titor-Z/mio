@@ -23,6 +23,15 @@ pub enum Command {
     /// 仅做类型检查，不执行。
     Check { path: PathBuf },
 
+    /// 把 TypeScript 子集 AOT 编译为本机可执行文件（阶段 B 原生后端）。
+    ///
+    /// `out` 为产物路径（缺省为入口同目录同名文件）；`emit_obj` 为真时只产 `.o` 不链接。
+    Build {
+        path: PathBuf,
+        out: Option<PathBuf>,
+        emit_obj: bool,
+    },
+
     /// 执行配置文件中声明的任务；`name` 为 `None` 时列出全部任务。
     Task { name: Option<String> },
 
@@ -46,7 +55,9 @@ impl Command {
     /// 取出命令携带的入口文件路径，供配置发现推导起始目录。
     pub fn entry_path(&self) -> Option<&std::path::Path> {
         match self {
-            Self::Run { path } | Self::Check { path } => Some(path.as_path()),
+            Self::Run { path } | Self::Check { path } | Self::Build { path, .. } => {
+                Some(path.as_path())
+            }
             Self::Eval { .. }
             | Self::Repl
             | Self::Task { .. }
@@ -86,6 +97,9 @@ impl Cli {
         let mut config_path: Option<PathBuf> = None;
         let mut overrides = ConfigOverride::default();
         let mut early: Option<Command> = None;
+        // `build` 专用选项：在循环里先收集，再由 resolve_command 校验「只在 build 下合法」。
+        let mut build_out: Option<PathBuf> = None;
+        let mut build_emit_obj = false;
 
         let mut cursor = 0;
         while cursor < words.len() {
@@ -95,6 +109,15 @@ impl Cli {
                 "--help" | "-h" => early = Some(Command::Help),
                 "--typecheck" => overrides.typecheck = Some(String::from("on")),
                 "--no-typecheck" => overrides.typecheck = Some(String::from("off")),
+                // build 的产物路径与「只产 .o」开关（只能用于 build 子命令，见 resolve_command）。
+                "-o" | "--out" => {
+                    let value = words
+                        .get(cursor + 1)
+                        .ok_or_else(|| String::from("选项 -o 需要一个输出路径参数"))?;
+                    build_out = Some(PathBuf::from(value));
+                    cursor += 1;
+                }
+                "--emit-obj" => build_emit_obj = true,
                 "--config" | "-c" => {
                     let value = words
                         .get(cursor + 1)
@@ -110,7 +133,11 @@ impl Cli {
             cursor += 1;
         }
 
-        let command = early.unwrap_or(Self::resolve_command(&positional)?);
+        let command = early.unwrap_or(Self::resolve_command(
+            &positional,
+            build_out,
+            build_emit_obj,
+        )?);
         Ok(Self {
             command,
             config_path,
@@ -121,8 +148,17 @@ impl Cli {
     /// 依据位置参数判定子命令。
     ///
     /// 使用切片模式匹配而非 `if/else` 链，保证每一种合法形态与非法形态都显式列出。
-    fn resolve_command(positional: &[String]) -> Result<Command, String> {
+    fn resolve_command(
+        positional: &[String],
+        out: Option<PathBuf>,
+        emit_obj: bool,
+    ) -> Result<Command, String> {
         let words: Vec<&str> = positional.iter().map(String::as_str).collect();
+        // `-o` 与 `--emit-obj` 只对 build 有意义：其他子命令带上它们属于用法错误，直接拒绝。
+        let is_build = words.first() == Some(&"build");
+        if !is_build && (out.is_some() || emit_obj) {
+            return Err(String::from("选项 -o / --emit-obj 只能用于 build 子命令"));
+        }
         match words.as_slice() {
             [] => Ok(Command::Help),
             ["run", path] => Ok(Command::Run {
@@ -134,6 +170,11 @@ impl Cli {
             ["repl"] => Ok(Command::Repl),
             ["check", path] => Ok(Command::Check {
                 path: PathBuf::from(path),
+            }),
+            ["build", path] => Ok(Command::Build {
+                path: PathBuf::from(path),
+                out,
+                emit_obj,
             }),
             ["task"] => Ok(Command::Task { name: None }),
             ["task", name] => Ok(Command::Task {
@@ -148,6 +189,7 @@ impl Cli {
             ["run"] => Err(String::from("run 子命令需要一个文件路径")),
             ["eval"] => Err(String::from("eval 子命令需要一段源码")),
             ["check"] => Err(String::from("check 子命令需要一个文件路径")),
+            ["build"] => Err(String::from("build 子命令需要一个文件路径")),
             [unknown, ..] => Err(format!("未知子命令：{unknown}，可执行 mio --help 查看用法")),
         }
     }
@@ -196,6 +238,44 @@ mod tests {
             Cli::parse(["types"]).expect("应解析成功").command,
             Command::Types
         );
+    }
+
+    #[test]
+    fn parses_build_command_with_options() {
+        let cli = Cli::parse(["build", "app.ts", "-o", "app", "--emit-obj"]).expect("应解析成功");
+        assert_eq!(
+            cli.command,
+            Command::Build {
+                path: PathBuf::from("app.ts"),
+                out: Some(PathBuf::from("app")),
+                emit_obj: true,
+            }
+        );
+    }
+
+    #[test]
+    fn builds_default_output_when_out_absent() {
+        let cli = Cli::parse(["build", "app.ts"]).expect("应解析成功");
+        assert_eq!(
+            cli.command,
+            Command::Build {
+                path: PathBuf::from("app.ts"),
+                out: None,
+                emit_obj: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_build_only_options_on_other_commands() {
+        let err = Cli::parse(["run", "app.ts", "-o", "x"]).expect_err("应报错");
+        assert!(err.contains("只能用于 build 子命令"));
+    }
+
+    #[test]
+    fn rejects_build_without_path() {
+        let err = Cli::parse(["build"]).expect_err("应报错");
+        assert!(err.contains("需要一个文件路径"));
     }
 
     #[test]

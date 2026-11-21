@@ -19,6 +19,7 @@ mio —— TypeScript 一等公民的运行时
   mio eval <code>       执行一段内联源码
   mio repl              启动交互式求值环境
   mio check <file>      仅做类型检查（内置 tsrs 编译器，无外部依赖）
+  mio build <file>      编译为原生可执行文件（阶段 B 原生后端，TS 子集）
   mio task [name]       执行 mio.json 中声明的任务
   mio init              在当前目录创建项目骨架与类型声明
   mio types             刷新 .mio/@types/ 下的运行时类型声明
@@ -26,6 +27,8 @@ mio —— TypeScript 一等公民的运行时
 
 选项:
   -c, --config <path>   指定配置文件路径
+  -o, --out <path>      build 的产物路径（缺省为入口同目录同名文件）
+      --emit-obj        build 只产出目标文件，不做链接
       --typecheck       本次执行前做类型检查
       --no-typecheck    本次执行前不做类型检查
   -v, --version         打印版本号
@@ -51,7 +54,47 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
         Command::Eval { source } => eval_source(source),
         Command::Repl => super::repl::run(),
         Command::Check { path } => check_file(path, config),
+        Command::Build {
+            path,
+            out,
+            emit_obj,
+        } => build_file(path, out.as_deref(), *emit_obj),
     }
+}
+
+/// 处理 `mio build`：把 TypeScript 子集 AOT 编译为本机可执行文件。
+///
+/// 实现全部委托给独立 workspace 中的 `mio-native`（`compile_file`）：主 crate 只做参数
+/// 归一与错误渲染，OXC/Cranelift 的类型不会漏进 `cli` 层。产物路径缺省为入口文件去掉
+/// 扩展名的同名文件（与 `cc`、`go build` 的习惯一致）。
+///
+/// `native` feature 关闭时（`--no-default-features` 的瘦 binary）不静默失效，而是给出
+/// 明确的「未启用」提示，避免用户误以为是源码问题。
+fn build_file(path: &std::path::Path, out: Option<&std::path::Path>, emit_obj: bool) -> CliResult {
+    #[cfg(not(feature = "native"))]
+    {
+        // 未启用原生后端时参数无意义，显式忽略并说明原因。
+        let _ = (path, out, emit_obj);
+        Err(String::from(
+            "本次构建未启用 native 后端（mio 以 --no-default-features 编译）；请使用默认构建，或用 mio run 直接执行",
+        ))
+    }
+    #[cfg(feature = "native")]
+    {
+        let out_path =
+            out.map_or_else(|| default_artifact_path(path), std::path::Path::to_path_buf);
+        mio_native::compile_file(&path.to_string_lossy(), &out_path, emit_obj)?;
+        if !emit_obj {
+            println!("已生成 {}", out_path.display());
+        }
+        Ok(())
+    }
+}
+
+/// 缺省产物路径：入口文件去掉扩展名（`app.ts` → `app`）。
+#[cfg(feature = "native")]
+fn default_artifact_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("")
 }
 
 /// 执行一次纯类型检查：复用 fork 进来的 tsrs 编译器驱动 `tsrs_execute::command_line`。

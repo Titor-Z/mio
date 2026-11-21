@@ -58,11 +58,23 @@ rustls-rustcrypto = { version = "0.0.2-alpha", features = ["std", "tls12"] }
 webpki-roots = "1.0.11"
 include_dir = "0.7.4"
 
+# 阶段 B 原生编译器（可选模块）。跨 workspace 的 path 依赖，与上面的 tsrs_execute 同一模式：
+# 主 crate 单向依赖 `native/`，`native/` 不回头引用根 crate，两边仍各自是独立 workspace。
+# 由 feature `native` 门控：关掉后主 binary 不含 cranelift，`mio build` 给出明确提示而非静默失效。
+mio-native = { path = "native/crates/mio-native", optional = true }
+
 [profile.release]
 # fat LTO 在本项目依赖规模下编译时间超过十分钟，采用 thin LTO 折中
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[features]
+default = ["native"]
+
+# 阶段 B 原生后端：启用 `mio build`（TS 子集 → Cranelift → 本机可执行文件）。
+# 关闭可用于裁剪体积（不引入 cranelift 系列依赖）。
+native = ["dep:mio-native"]
 
 [dev-dependencies]
 rcgen = "0.14.10"
