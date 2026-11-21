@@ -5,7 +5,7 @@
 
 ## 结论：达标
 
-三条验收门槛全部满足（测量环境：macOS 15 / x86_64 / Apple clang 14 / node v24.18.0，release 构建，执行耗时取 3 次最优，数字可由 `cargo run --release -p mio-native-bench` 复现）：
+三条验收门槛全部满足（测量环境：macOS 15 / x86_64 / 4 核 / Apple clang 14 / node v24.18.0，release 构建，执行耗时取 3 次最优，数字可由 `cargo run --release -p mio-native-bench` 复现）：
 
 | 门槛 | 要求 | 实测 | 判定 |
 |---|---|---|---|
@@ -83,7 +83,7 @@ OXC parser → `lower`（AST → TIR，两遍降低：第一遍收集函数签�
 - 语境：顶层调用语句、`let` 初始化式、赋值 rhs；嵌套表达式语境（如 `print(add(1,2))`）保留调用，函数定义按「剩余调用点」兜底保留。
 - 变量重命名 `name#{call_id}` 防捕获；参数以实参初始化的 Let 承接；返回值落 `.ret#{call_id}` 临时变量。
 
-**实测**（release，3 次最优）：
+**实测**（release，3 次最优；当时机器负载约 4.3/4 核，数字偏保守）：
 
 | 用例 | 内联前 | 内联后 | 手工内联对照 |
 |---|---|---|---|
@@ -101,3 +101,9 @@ OXC parser → `lower`（AST → TIR，两遍降低：第一遍收集函数签�
 实测（同一负载口径）：`loop 1e8 control`（每轮 `let a = abs(d); sum = add(sum, a)` 两条语句级调用）0.10s——若不内联约 0.25s（每轮两次调用固定开销），内联后接近无调用循环（0.07s）的量级，多出的 0.03s 是 abs 的分支块与更高寄存器压力，属预期。
 
 冒烟新增 4 条：`inline-control-flow`（abs 模式，30）、`inline-multi-return`（clamp 三分支，3/2/3）、`inline-void-early-return`（void 提前 return，2/1）、`inline-loop-return-kept`（循环内 return 拒绝内联、保留调用照常运行，3）；内联单测增至 5 条（新增包裹循环结构断言、循环内 return 拒绝）。
+
+## 测量口径与噪声
+
+- 全部数字为同一台机器上的 3 次最优值；测量期间常有 `tsserver`/`rust-analyzer` 等后台进程，负载峰值接近 4 核饱和，因此绝对值偏保守，**结论只看同批次内的相对关系**。
+- 整数循环档的 `cc -O2` 会把整个循环常量折叠为常数，0.00s 不构成有效对照（已在对应小节注明）；有效对照是浮点循环档与 `loop 1e8 call/control`（均有真实数据依赖）。
+- 复现命令：`cd native && cargo run --release -p mio-native-bench`（输出会做三方 stdout 数值交叉验证）。

@@ -149,33 +149,36 @@ fn inline_stmt(stmt: Stmt, defs: &HashMap<String, Func>, counter: &mut u64, out:
             }
             out.push(Stmt::Let { name, ty, init });
         }
-        // f(args); 或 x = f(args); → 同 let，赋值 rhs 换引用。
-        Stmt::Expr(e) => {
-            if let Expr::Call {
+        // 语句级调用两种形态：裸调用 `f(args);` 与赋值 rhs `x = f(args);`。
+        // 用 match 一次分派（同一表达式上不做连续 if-let 判断）。
+        Stmt::Expr(e) => match &e {
+            // 裸调用：prelude 已含结果变量声明，本语境无人读取它，作为 SSA 死值由后端消除。
+            Expr::Call {
                 name: callee, args, ..
-            } = &e
-                && let Some(expanded) = try_inline_call(callee, args, defs, counter)
-            {
-                // prelude 已含结果变量声明；本语境无人读取它，作为 SSA 死值由后端消除。
-                out.extend(expanded);
-                return;
-            }
-            if let Expr::Assign { name, ty, value } = &e
-                && let Expr::Call {
+            } => match try_inline_call(callee, args, defs, counter) {
+                Some(expanded) => out.extend(expanded),
+                None => out.push(Stmt::Expr(e)),
+            },
+            // 赋值 rhs 是调用：展开后把 rhs 换成对结果变量的引用。
+            Expr::Assign { name, ty, value }
+                if let Expr::Call {
                     name: callee, args, ..
-                } = value.as_ref()
-                && let Some(expanded) = try_inline_call(callee, args, defs, counter)
+                } = value.as_ref() =>
             {
-                out.extend(expanded);
-                out.push(Stmt::Expr(Expr::Assign {
-                    name: name.clone(),
-                    ty: *ty,
-                    value: Box::new(Expr::Var(expanded_result_name(callee, *counter), *ty)),
-                }));
-                return;
+                match try_inline_call(callee, args, defs, counter) {
+                    Some(expanded) => {
+                        out.extend(expanded);
+                        out.push(Stmt::Expr(Expr::Assign {
+                            name: name.clone(),
+                            ty: *ty,
+                            value: Box::new(Expr::Var(expanded_result_name(callee, *counter), *ty)),
+                        }));
+                    }
+                    None => out.push(Stmt::Expr(e)),
+                }
             }
-            out.push(Stmt::Expr(e));
-        }
+            _ => out.push(Stmt::Expr(e)),
+        },
         // 嵌套块语境：递归重写（if/while/for 的体）。
         Stmt::If { cond, then, els } => {
             let mut then_out = Vec::new();
@@ -436,6 +439,8 @@ fn rename_expr(e: &Expr, mangle: &dyn Fn(&str) -> String) -> Expr {
 }
 
 /// 收集程序里剩余的全部函数调用名字（含嵌套块与实参）。
+/// 收集程序里剩余的全部函数调用名字（含嵌套块与实参）。
+/// 用途：内联移除定义后，若仍有未被展开的调用点（嵌套表达式语境），据此把定义放回。
 fn collect_call_names(functions: &[Func]) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     for func in functions {
@@ -446,6 +451,7 @@ fn collect_call_names(functions: &[Func]) -> std::collections::HashSet<String> {
     names
 }
 
+/// 收集单条语句（递归进 if/while/for 的体）里出现的调用名字。
 fn collect_calls_in_block(stmt: &Stmt, names: &mut std::collections::HashSet<String>) {
     match stmt {
         Stmt::Expr(e) | Stmt::Let { init: e, .. } => collect_calls_in_expr(e, names),
@@ -491,6 +497,7 @@ fn collect_calls_in_block(stmt: &Stmt, names: &mut std::collections::HashSet<Str
     }
 }
 
+/// 收集表达式内（递归进实参）出现的调用名字。
 fn collect_calls_in_expr(e: &Expr, names: &mut std::collections::HashSet<String>) {
     match e {
         Expr::Call { name, args, .. } => {
