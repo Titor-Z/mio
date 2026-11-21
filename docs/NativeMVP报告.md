@@ -93,3 +93,11 @@ OXC parser → `lower`（AST → TIR，两遍降低：第一遍收集函数签�
 内联后「带调用循环」与「无调用循环」持平（0.07s vs 0.07s），调用开销完全消除。bench 已加入 `loop 1e8 call` 用例（C 对照用 `static inline`，口径注明；cc 该档同样被常量折叠失真）。
 
 **冒烟**：新增 `inline-loop`（4950）与 `inline-nested-kept`（嵌套语境保留定义，42）两条成功用例；内联模块 3 条单测（展开与重命名、递归排除、嵌套块重写）。
+
+### 带控制流的内联（续）
+
+边界放宽到**允许 if/while/for 与提前 return**（仍拒循环体内的 return——转换出的 break 会错误绑定内层循环，该形态保留调用）。展开形态：结果变量（零值占位，落空路径语义与原 codegen fallback 一致）+ 只执行一次的包裹 `while(true)`，`return e` 转换为「结果变量赋值 + break」。
+
+实测（同一负载口径）：`loop 1e8 control`（每轮 `let a = abs(d); sum = add(sum, a)` 两条语句级调用）0.10s——若不内联约 0.25s（每轮两次调用固定开销），内联后接近无调用循环（0.07s）的量级，多出的 0.03s 是 abs 的分支块与更高寄存器压力，属预期。
+
+冒烟新增 4 条：`inline-control-flow`（abs 模式，30）、`inline-multi-return`（clamp 三分支，3/2/3）、`inline-void-early-return`（void 提前 return，2/1）、`inline-loop-return-kept`（循环内 return 拒绝内联、保留调用照常运行，3）；内联单测增至 5 条（新增包裹循环结构断言、循环内 return 拒绝）。

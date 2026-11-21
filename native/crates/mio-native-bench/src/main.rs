@@ -73,6 +73,34 @@ const CASES: &[Case] = &[
              let sum = 0; for (let i = 0; i < 100000000; i = i + 1) sum = add(sum, i); console.log(sum);\n",
     },
     Case {
+        name: "loop 1e8 control",
+        ts: "function abs(x: i64): i64 {\n\
+             \x20 if (x < 0) {\n\
+             \x20   return -x;\n\
+             \x20 }\n\
+             \x20 return x;\n\
+             }\n\
+             function add(a: i64, b: i64): i64 {\n\
+             \x20 return a + b;\n\
+             }\n\
+             function main(): void {\n\
+             \x20 let sum: i64 = 0;\n\
+             \x20 for (let i: i64 = 0; i < 100000000; i = i + 1) {\n\
+             \x20   let d: i64 = i - 50;\n\
+             \x20   let a: i64 = abs(d);\n\
+             \x20   sum = add(sum, a);\n\
+             \x20 }\n\
+             \x20 print(sum);\n\
+             }\n",
+        c: "#include <stdio.h>\n\
+            static inline long long absc(long long x) { return x < 0 ? -x : x; }\n\
+            static inline long long add(long long a, long long b) { return a + b; }\n\
+            int main() { long long sum = 0; for (long long i = 0; i < 100000000; i = i + 1) { long long d = i - 50; sum = add(sum, absc(d)); } printf(\"%lld\\n\", sum); return 0; }\n",
+        js: "function abs(x) { return x < 0 ? -x : x; }\n\
+             function add(a, b) { return a + b; }\n\
+             let sum = 0; for (let i = 0; i < 100000000; i = i + 1) { const d = i - 50; sum = add(sum, abs(d)); } console.log(sum);\n",
+    },
+    Case {
         name: "loop 1e8 float",
         ts: "function main(): void {\n\
              \x20 let acc: f64 = 0.0;\n\

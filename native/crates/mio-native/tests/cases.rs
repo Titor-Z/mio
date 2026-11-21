@@ -123,6 +123,78 @@ pub const CASES: &[(&str, &str, &str)] = &[
          }\n",
         "4950\n",
     ),
+    // 带控制流的小函数内联：if 内提前 return（abs 模式）。
+    (
+        "inline-control-flow",
+        "function abs(x: i64): i64 {\n\
+         \x20 if (x < 0) {\n\
+         \x20   return -x;\n\
+         \x20 }\n\
+         \x20 return x;\n\
+         }\n\
+         function main(): void {\n\
+         \x20 let sum: i64 = 0;\n\
+         \x20 for (let i: i64 = -5; i <= 5; i = i + 1) {\n\
+         \x20   let a: i64 = abs(i);\n\
+         \x20   sum = sum + a;\n\
+         \x20 }\n\
+         \x20 print(sum);\n\
+         }\n",
+        "30\n",
+    ),
+    // 多分支提前 return（clamp 模式）。
+    (
+        "inline-multi-return",
+        "function clamp(v: i32, lo: i32, hi: i32): i32 {\n\
+         \x20 if (v < lo) {\n\
+         \x20   return lo;\n\
+         \x20 }\n\
+         \x20 if (v > hi) {\n\
+         \x20   return hi;\n\
+         \x20 }\n\
+         \x20 return v;\n\
+         }\n\
+         function main(): void {\n\
+         \x20 print(clamp(5, 1, 3));\n\
+         \x20 print(clamp(2, 1, 3));\n\
+         \x20 print(clamp(9, 1, 3));\n\
+         }\n",
+        "3\n2\n3\n",
+    ),
+    // void 函数的提前 return（只转换为 break，无结果变量）。
+    (
+        "inline-void-early-return",
+        "function mark(verbose: bool): void {\n\
+         \x20 if (verbose) {\n\
+         \x20   print(1);\n\
+         \x20   return;\n\
+         \x20 }\n\
+         \x20 print(2);\n\
+         }\n\
+         function main(): void {\n\
+         \x20 mark(false);\n\
+         \x20 mark(true);\n\
+         }\n",
+        "2\n1\n",
+    ),
+    // 循环体内的 return 拒绝内联（语义无法保持），保留调用照常运行。
+    (
+        "inline-loop-return-kept",
+        "function first_nonzero(xs: i32, n: i32): i32 {\n\
+         \x20 let i: i32 = 0;\n\
+         \x20 while (i < n) {\n\
+         \x20   if (xs + i > 0) {\n\
+         \x20     return i;\n\
+         \x20   }\n\
+         \x20   i = i + 1;\n\
+         \x20 }\n\
+         \x20 return -1;\n\
+         }\n\
+         function main(): void {\n\
+         \x20 print(first_nonzero(-2, 4));\n\
+         }\n",
+        "3\n",
+    ),
     // 嵌套语境（print 的实参是调用）不展开，函数定义保留，输出不变。
     (
         "inline-nested-kept",
