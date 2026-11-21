@@ -108,6 +108,15 @@ impl BoaEngine {
         self.timeout_ms = timeout_ms;
         self
     }
+
+    /// 把 `mio.json` 的 `log` 配置（级别 + 是否 JSON）落到 `@std/log` 的线程局部状态。
+    ///
+    /// 脚本仍可用 `setLevel()` 运行时修改；这里的值只是初值。
+    #[must_use]
+    pub fn with_log(self, level: &str, json: bool) -> Self {
+        super::log::configure(level, json);
+        self
+    }
 }
 
 impl Engine for BoaEngine {

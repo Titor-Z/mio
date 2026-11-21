@@ -273,6 +273,66 @@ await file.close();
 
 > 没有同步版本（`readFileSync` 之类）：用 `await` 即可表达同步语义，且不会冻结事件循环。
 
+### 3.8 `@std/os` 环境信息
+
+```ts
+import { platform, arch, hostname, homedir, tmpdir, cwd, pid, eol } from "@std/os";
+
+platform();   // "darwin" | "linux" | "windows" ...
+arch();       // "x86_64" | "aarch64" ...
+hostname();   // 主机名（拿不到时为 "localhost"）
+homedir();    // string | undefined
+tmpdir();     // 临时目录
+cwd();        // 当前工作目录（目录已删除时抛 TypeError）
+pid();        // 进程号
+eol;          // "\n" 或 "\r\n"
+```
+
+全部同步、无副作用，不触发事件循环。
+
+### 3.9 `@std/env` 环境变量
+
+```ts
+import { get, set, has, remove, toObject } from "@std/env";
+
+get("HOME");                  // string | undefined
+has("HOME");                  // boolean
+set("APP_ENV", "production"); // 只改本进程内 @std/env 的视图
+remove("APP_ENV");            // 返回它此前是否存在
+toObject();                   // 全部环境变量（按键排序）
+```
+
+> 删除叫 `remove` 而不是 `delete`：`delete` 是 TypeScript 保留字，声明文件里无法作函数名。
+> `set` / `remove` 不修改真实进程环境（多线程下那样做不安全），但 mio 不派生子进程，所以对你完全等价。
+
+### 3.10 `@std/encoding` 编解码
+
+```ts
+import { encodeBase64, decodeBase64, encodeHex, decodeHex } from "@std/encoding";
+
+encodeBase64("foo");                 // "Zm9v"
+decodeBase64("Zm9v");                // Uint8Array([102, 111, 111])
+encodeHex(new Uint8Array([0, 255])); // "00ff"
+decodeHex("00FF");                   // Uint8Array([0, 255])
+```
+
+字符串按 UTF-8 取字节；解码非法输入抛 `TypeError`（base64 允许省略填充与空白，hex 接受大小写）。
+
+### 3.11 `@std/log` 日志
+
+```ts
+import { debug, info, warn, error, setLevel, getLevel } from "@std/log";
+
+info("服务启动", { port: 8787 });  // 写 stderr，不污染 stdout
+setLevel("debug");                 // 运行时改级别，立即生效
+getLevel();                        // "debug"
+error("出错了");                    // 级别低于阈值时静默丢弃
+```
+
+- 级别：`silent` / `error` / `warn` / `info` / `debug`，与 `mio.json` 的 `log.level` 同一套。
+- 初值来自配置（`mio.json` 或 `MIO_LOG_LEVEL`），脚本可用 `setLevel()` 覆盖；非法取值抛 `TypeError`。
+- `log.json: true` 时每行输出结构化 JSON：`{"level":"info","msg":"...","ts":1699999999999}`。
+
 ## 4. 交互式 REPL
 
 直接运行 `mio repl` 进入交互式求值，变量与函数声明在多次输入之间保持：

@@ -93,3 +93,66 @@ fn decode_input_bytes(value: &JsValue, context: &mut Context) -> JsResult<Vec<u8
         .with_message("decode expects a typed array or ArrayBuffer")
         .into())
 }
+
+// ============================================================================
+// `@std/encoding`（base64 / hex）
+// ============================================================================
+
+/// 导出的方法表。
+const STD_ENCODING_METHODS: &[(&str, super::support::NativeMethod)] = &[
+    ("encodeBase64", std_encode_base64),
+    ("decodeBase64", std_decode_base64),
+    ("encodeHex", std_encode_hex),
+    ("decodeHex", std_decode_hex),
+];
+
+/// 装配 `@std/encoding` 合成模块（`encode*` 出文本，`decode*` 出 `Uint8Array`）。
+pub(super) fn build_encoding_module(context: &mut Context) -> JsResult<boa_engine::Module> {
+    super::support::synthetic_module("encoding", STD_ENCODING_METHODS, &[], context)
+}
+
+/// `encodeBase64(input)`：`Uint8Array` / `ArrayBuffer` / 字符串 → base64 文本。
+fn std_encode_base64(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let bytes = encoding_input_bytes(args.first().unwrap_or(&JsValue::undefined()), context)?;
+    let text = crate::stdlib::encoding::encode_base64(&bytes);
+    Ok(JsValue::from(js_string!(text.as_str())))
+}
+
+/// `decodeBase64(text)`：base64 文本 → `Uint8Array`。
+fn std_decode_base64(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let text = super::support::to_text(args.first().unwrap_or(&JsValue::undefined()), context)?;
+    let bytes = crate::stdlib::encoding::decode_base64(&text)
+        .map_err(|message| JsNativeError::typ().with_message(message))?;
+    Ok(JsValue::from(JsUint8Array::from_iter(bytes, context)?))
+}
+
+/// `encodeHex(input)`：`Uint8Array` / `ArrayBuffer` / 字符串 → 小写 hex 文本。
+fn std_encode_hex(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let bytes = encoding_input_bytes(args.first().unwrap_or(&JsValue::undefined()), context)?;
+    let text = crate::stdlib::encoding::encode_hex(&bytes);
+    Ok(JsValue::from(js_string!(text.as_str())))
+}
+
+/// `decodeHex(text)`：hex 文本 → `Uint8Array`。
+fn std_decode_hex(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let text = super::support::to_text(args.first().unwrap_or(&JsValue::undefined()), context)?;
+    let bytes = crate::stdlib::encoding::decode_hex(&text)
+        .map_err(|message| JsNativeError::typ().with_message(message))?;
+    Ok(JsValue::from(JsUint8Array::from_iter(bytes, context)?))
+}
+
+/// 编码入参字节：字符串按 UTF-8 取字节，其余按 BufferSource 取。
+fn encoding_input_bytes(value: &JsValue, context: &mut Context) -> JsResult<Vec<u8>> {
+    if let Some(text) = value.as_string() {
+        return Ok(text.to_std_string_escaped().into_bytes());
+    }
+    decode_input_bytes(value, context)
+}

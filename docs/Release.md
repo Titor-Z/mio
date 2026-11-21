@@ -7,6 +7,30 @@ TodoID 规则：`TD` + UUID。TaolunID 规则：`TL` + `YYYYMMDDThhmmss`。
 
 ---
 
+## 0.3.0（2026-11-21）
+
+**状态**：已发布。
+
+**更新内容**
+
+- 新增 `@std/os`：`platform` / `arch` / `hostname` / `homedir` / `tmpdir` / `cwd` / `pid` 与常量 `eol`。
+- 新增 `@std/env`：`get` / `set` / `remove` / `has` / `toObject`；写操作走进程内覆盖表，不触碰真实进程环境（避开 `std::env::set_var` 的 unsafe 约束）。
+- 新增 `@std/encoding`：base64 与 hex 编解码，二进制统一 `Uint8Array`，非法输入抛 `TypeError`。
+- 新增 `@std/log`：`debug` / `info` / `warn` / `error` / `setLevel` / `getLevel`；写 stderr，级别初值来自配置，运行时可改。
+- 四份声明随 `mio init` / `mio types` / `mio check` 落地，`index.d.ts` 以 `/// <reference path>` 串联。
+- 手册补四节 API 说明与速查表条目，`site/dist` 重建。
+
+**TodoLists[]**
+
+- TD0798b63b3643493fa05277e78788d69a（标准库第二批）
+- TD4756fd3be1c2406b980d4e33425ce792（Std 标准库，本批收尾）
+
+**关联讨论**
+
+- TL20261121T190813
+
+---
+
 ## 0.2.2（2026-11-21）
 
 **状态**：已发布。

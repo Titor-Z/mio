@@ -2039,3 +2039,167 @@ fn zero_period_interval_yields_between_rounds_instead_of_spinning() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ============================================================================
+// 标准库扩展：@std/os / @std/env / @std/encoding / @std/log
+// ============================================================================
+
+#[test]
+fn run_resolves_std_os_builtin() {
+    let dir = unique_dir("stdos");
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { platform, arch, tmpdir, cwd, pid, eol } from '@std/os';\n\
+         console.log(typeof platform(), typeof arch(), tmpdir().length > 0);\n\
+         console.log(cwd().length > 0, Number.isInteger(pid()), eol === '\\n' || eol === '\\r\\n');\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("main.ts").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "@std/os 应可用：{output:?}");
+    assert_eq!(stdout.trim(), "string string true\ntrue true true");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_resolves_std_env_builtin() {
+    let dir = unique_dir("stdenv");
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { get, set, has, remove, toObject } from '@std/env';\n\
+         set('MIO_E2E_ENV', 'abc');\n\
+         console.log(get('MIO_E2E_ENV'), has('MIO_E2E_ENV'), toObject()['MIO_E2E_ENV']);\n\
+         console.log(remove('MIO_E2E_ENV'), has('MIO_E2E_ENV'), get('MIO_E2E_ENV'));\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("main.ts").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "@std/env 应可用：{output:?}");
+    assert_eq!(stdout.trim(), "abc true abc\ntrue false undefined");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_resolves_std_encoding_builtin() {
+    let dir = unique_dir("stdencoding");
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { encodeBase64, decodeBase64, encodeHex, decodeHex } from '@std/encoding';\n\
+         const bytes = new Uint8Array([102, 111, 111]);\n\
+         console.log(encodeBase64(bytes), encodeHex(bytes), encodeBase64('foo'));\n\
+         console.log(decodeBase64('Zm9v').length, decodeHex('666F6F')[0]);\n\
+         try {\n\
+         \x20 decodeHex('zz');\n\
+         } catch (error) {\n\
+         \x20 console.log((error as Error).name);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("main.ts").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "@std/encoding 应可用：{output:?}");
+    assert_eq!(stdout.trim(), "Zm9v 666f6f Zm9v\n3 102\nTypeError");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_std_log_honors_level_and_set_level() {
+    let dir = unique_dir("stdlog");
+    std::fs::write(dir.join("mio.json"), "{ \"log\": { \"level\": \"info\" } }").unwrap();
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { info, error, debug, setLevel, getLevel } from '@std/log';\n\
+         info('hidden-before');\n\
+         setLevel('silent');\n\
+         error('hidden-after');\n\
+         console.log(getLevel());\n\
+         setLevel('debug');\n\
+         info('visible-after');\n\
+         debug('visible-debug');\n",
+    )
+    .unwrap();
+
+    let output = run(&[
+        "-c",
+        dir.join("mio.json").to_str().unwrap(),
+        "run",
+        dir.join("main.ts").to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "@std/log 应可用：{output:?}");
+    // 配置级别 info：debug 不输出，info 输出。
+    assert!(stderr.contains("hidden-before"), "info 应输出：{stderr}");
+    assert!(!stderr.contains("hidden-after"), "silent 应静默：{stderr}");
+    assert_eq!(stdout.trim(), "silent");
+    assert!(
+        stderr.contains("visible-after"),
+        "改级别后 info 应恢复：{stderr}"
+    );
+    assert!(
+        stderr.contains("visible-debug"),
+        "debug 级别应输出 debug：{stderr}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_std_log_rejects_unknown_level() {
+    let dir = unique_dir("stdlog-bad");
+    std::fs::write(
+        dir.join("main.ts"),
+        "import { setLevel } from '@std/log';\n\
+         try {\n\
+         \x20 setLevel('verbose');\n\
+         } catch (error) {\n\
+         \x20 console.log((error as Error).name);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", dir.join("main.ts").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "非法级别应可被捕获：{output:?}");
+    assert_eq!(stdout.trim(), "TypeError");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn check_knows_extra_std_modules() {
+    let dir = unique_dir("check-std-extra");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        "import { platform, pid, eol } from '@std/os';\n\
+         import { get, set, remove, toObject } from '@std/env';\n\
+         import { encodeBase64, decodeHex } from '@std/encoding';\n\
+         import { info, setLevel, getLevel } from '@std/log';\n\
+         const home: string | undefined = get('HOME');\n\
+         const view: Record<string, string> = toObject();\n\
+         const bytes: Uint8Array = decodeHex('666f6f');\n\
+         set('MIO_CHECK', '1');\n\
+         remove('MIO_CHECK');\n\
+         setLevel('debug');\n\
+         const level: string = getLevel();\n\
+         info(platform(), pid(), eol, encodeBase64(bytes), home, view, level);\n",
+    )
+    .unwrap();
+
+    let output = run(&["check", file.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "四个扩展模块的类型应可解析：{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

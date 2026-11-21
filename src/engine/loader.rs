@@ -168,6 +168,15 @@ fn build_builtin(name: &str, context: &mut Context) -> JsResult<Module> {
     if name == "fs" {
         return crate::engine::fs::build_fs_module(context);
     }
+    // 同理：`os` 返回数值、`env` 返回 `undefined`/对象、`encoding` 返回 `Uint8Array`、
+    // `log` 返回 `undefined` 且要写 stderr，均走各自的专用构建器。
+    match name {
+        "os" => return super::os::build_os_module(context),
+        "env" => return super::env::build_env_module(context),
+        "encoding" => return super::encoding::build_encoding_module(context),
+        "log" => return super::log::build_log_module(context),
+        _ => {}
+    }
 
     let builtin = crate::stdlib::lookup(name).ok_or_else(|| {
         JsNativeError::typ().with_message(format!("未知的内建模块 `@std/{name}`"))

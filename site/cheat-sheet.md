@@ -106,6 +106,33 @@ h.get("X-Custom");            // "value"
 h.delete("X-Custom");
 ```
 
+## 🌍 环境与日志
+
+```ts
+import { platform, arch, tmpdir, cwd, pid } from "@std/os";
+import { get, set, has, remove, toObject } from "@std/env";
+import { info, warn, error, setLevel } from "@std/log";
+
+console.log(platform(), arch(), tmpdir());
+const home = get("HOME");        // string | undefined
+set("APP_ENV", "production");
+remove("APP_ENV");               // boolean
+
+info("启动完成");                 // 写 stderr
+setLevel("debug");               // 运行时改级别：silent|error|warn|info|debug
+```
+
+## 🔐 编解码
+
+```ts
+import { encodeBase64, decodeBase64, encodeHex, decodeHex } from "@std/encoding";
+
+encodeBase64("foo");              // "Zm9v"
+decodeBase64("Zm9v");             // Uint8Array
+encodeHex(new Uint8Array([0,255])); // "00ff"
+decodeHex("00FF");                // Uint8Array
+```
+
 ## 🎯 常用模式
 
 ### JSON 响应模板

@@ -8,8 +8,17 @@
 //! 不出现任何 `boa_*` 类型。把 [`BuiltinFunction`] 包装成脚本可见的 `NativeFunction`、
 //! 组装成合成模块，是 `engine/loader.rs` 的职责（那里允许 `boa_*`）。
 //! 阶段 B 更换引擎时，本模块的算法与描述表原样复用。
+//!
+//! 两类装配方式：
+//! - 「字符串进、字符串出」（`path`）用 [`BuiltinFunction`] 描述表，走通用装配；
+//! - 返回值不是字符串的模块（`fs` / `os` / `env` / `encoding` / `log`）在 `engine` 侧
+//!   各有一份专用构建器，本文件只挂一个空条目，让 `@std/<name>` 仍能被识别。
 
+pub mod encoding;
+pub mod env;
 pub(crate) mod fs;
+pub mod log;
+pub mod os;
 mod path;
 
 /// 一个内建函数的底层实现：接收脚本侧已转为 Rust `&str` 的实参，返回字符串结果或错误文本。
@@ -44,6 +53,28 @@ pub fn lookup(name: &str) -> Option<BuiltinModule> {
             functions: &[], // fs 由 engine 专用构建器装配（见 engine/loader.rs::build_fs_module）
             string_constants: &[],
         }),
+        // 以下四个模块的导出包含数值 / 布尔 / 对象 / undefined，通用装配表达不了，
+        // 同样由 engine 侧专用构建器装配；此处只登记名字，保证 `@std/<name>` 可识别。
+        "os" => Some(BuiltinModule {
+            name: "os",
+            functions: &[],
+            string_constants: &[],
+        }),
+        "env" => Some(BuiltinModule {
+            name: "env",
+            functions: &[],
+            string_constants: &[],
+        }),
+        "encoding" => Some(BuiltinModule {
+            name: "encoding",
+            functions: &[],
+            string_constants: &[],
+        }),
+        "log" => Some(BuiltinModule {
+            name: "log",
+            functions: &[],
+            string_constants: &[],
+        }),
         "path" => Some(BuiltinModule {
             name: "path",
             functions: path::FUNCTIONS,
@@ -70,6 +101,14 @@ mod tests {
     fn lookup_fs_exists() {
         let module = lookup("fs").expect("@std/fs 应已注册");
         assert!(module.functions.is_empty()); // fs 的导出由 engine 侧处理
+    }
+
+    #[test]
+    fn lookup_extra_std_modules_exist() {
+        for name in ["os", "env", "encoding", "log"] {
+            let module = lookup(name).unwrap_or_else(|| panic!("@std/{name} 应已注册"));
+            assert!(module.functions.is_empty()); // 导出均由 engine 侧专用构建器处理
+        }
     }
 
     #[test]

@@ -5,6 +5,10 @@
 
 /// <reference path="./std/path.d.ts" />
 /// <reference path="./std/fs.d.ts" />
+/// <reference path="./std/os.d.ts" />
+/// <reference path="./std/env.d.ts" />
+/// <reference path="./std/encoding.d.ts" />
+/// <reference path="./std/log.d.ts" />
 
 // =========================
 // Console

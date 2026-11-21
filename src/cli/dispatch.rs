@@ -128,6 +128,7 @@ fn run_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
     };
     BoaEngine::with_transpile(resolver, transpile)
         .with_timeout(config.config.run.timeout_ms)
+        .with_log(&config.config.log.level, config.config.log.json)
         .eval_module_file(path)
         .map(|_| ())
         .map_err(|error| error.to_string())

@@ -17,6 +17,18 @@ const STD_PATH: &str = include_str!("../../types/mio/std/path.d.ts");
 /// `@std/fs` 类型声明。
 const STD_FS: &str = include_str!("../../types/mio/std/fs.d.ts");
 
+/// `@std/os` 类型声明。
+const STD_OS: &str = include_str!("../../types/mio/std/os.d.ts");
+
+/// `@std/env` 类型声明。
+const STD_ENV: &str = include_str!("../../types/mio/std/env.d.ts");
+
+/// `@std/encoding` 类型声明。
+const STD_ENCODING: &str = include_str!("../../types/mio/std/encoding.d.ts");
+
+/// `@std/log` 类型声明。
+const STD_LOG: &str = include_str!("../../types/mio/std/log.d.ts");
+
 /// 初始化生成的运行配置。
 const MIO_JSON: &str = r#"{
   // mio 运行配置：影响运行行为的唯一真相。
@@ -100,6 +112,10 @@ pub(super) fn materialize_builtin_types() -> Result<PathBuf, String> {
     write_file(&index, TYPES_INDEX)?;
     write_file(&dir.join("mio/std/path.d.ts"), STD_PATH)?;
     write_file(&dir.join("mio/std/fs.d.ts"), STD_FS)?;
+    write_file(&dir.join("mio/std/os.d.ts"), STD_OS)?;
+    write_file(&dir.join("mio/std/env.d.ts"), STD_ENV)?;
+    write_file(&dir.join("mio/std/encoding.d.ts"), STD_ENCODING)?;
+    write_file(&dir.join("mio/std/log.d.ts"), STD_LOG)?;
     Ok(index)
 }
 
@@ -107,7 +123,14 @@ pub(super) fn materialize_builtin_types() -> Result<PathBuf, String> {
 fn write_types(root: &Path) -> CliResult {
     write_file(&root.join(".mio/@types/mio/index.d.ts"), TYPES_INDEX)?;
     write_file(&root.join(".mio/@types/mio/std/path.d.ts"), STD_PATH)?;
-    write_file(&root.join(".mio/@types/mio/std/fs.d.ts"), STD_FS)
+    write_file(&root.join(".mio/@types/mio/std/fs.d.ts"), STD_FS)?;
+    write_file(&root.join(".mio/@types/mio/std/os.d.ts"), STD_OS)?;
+    write_file(&root.join(".mio/@types/mio/std/env.d.ts"), STD_ENV)?;
+    write_file(
+        &root.join(".mio/@types/mio/std/encoding.d.ts"),
+        STD_ENCODING,
+    )?;
+    write_file(&root.join(".mio/@types/mio/std/log.d.ts"), STD_LOG)
 }
 
 /// 文件不存在才写入，避免覆盖用户已有配置。

@@ -3,6 +3,17 @@
 本文件只保留最新一个版本的发布说明，供 GitHub Actions 生成 release 使用。
 历史版本记录见 `docs/Release.md`。
 
+## 0.3.0
+
+### 标准库补齐：`@std/os` / `@std/env` / `@std/encoding` / `@std/log`
+
+- 新增 `@std/os`：`platform()`、`arch()`、`hostname()`、`homedir()`、`tmpdir()`、`cwd()`、`pid()` 与常量 `eol`，全部同步无副作用。
+- 新增 `@std/env`：`get` / `set` / `remove` / `has` / `toObject`。`set` / `remove` 走进程内覆盖表（不触碰真实进程环境，规避 `std::env::set_var` 在多线程下的 unsafe）。
+- 新增 `@std/encoding`：`encodeBase64` / `decodeBase64` / `encodeHex` / `decodeHex`，二进制统一 `Uint8Array`，非法输入抛 `TypeError`。
+- 新增 `@std/log`：`debug` / `info` / `warn` / `error` / `setLevel` / `getLevel`，输出到 stderr，级别初值来自 `log.level`（或 `MIO_LOG_LEVEL`），脚本可运行时修改。
+- 声明文件随 `mio init` / `mio types` / `mio check` 一并落地；`types/mio/index.d.ts` 用 `/// <reference path>` 串起全部 `@std/*` 声明。
+- 手册新增四节 API 说明与速查表条目。
+
 ## 0.2.2
 
 ### 修复

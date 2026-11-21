@@ -2,6 +2,7 @@
 //!
 //! 这些是 Boa 宿主侧的胶水，无规范语义，供 `url` / `blob` / `fetch` 等绑定复用。
 
+use boa_engine::JsString;
 use boa_engine::object::FunctionObjectBuilder;
 use boa_engine::object::builtins::JsFunction;
 use boa_engine::property::{Attribute, PropertyDescriptor, PropertyKey};
@@ -95,4 +96,52 @@ pub(super) fn register_constructor(
     context
         .register_global_property(js_string!(name), function, Attribute::all())
         .expect("安装全局构造器失败");
+}
+
+/// 一个导出方法的签名，与 `NativeFunction::from_fn_ptr` 一致。
+pub(super) type NativeMethod = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
+
+/// 按「导出名 → 方法」与「常量名 → 文本」表装配一个 `@std/*` 合成模块。
+///
+/// 初始化闭包只捕获两个 `&'static` 切片（均为 `Copy`），故可用 `from_copy_closure`；
+/// 真正的 `NativeFunction` 在求值时现场构造。需要返回对象或二进制、或自定义
+/// `undefined` 语义时，各自在 `engine/<模块>.rs` 里手写构建器。
+pub(super) fn synthetic_module(
+    module_name: &'static str,
+    methods: &'static [(&'static str, NativeMethod)],
+    constants: &'static [(&'static str, &'static str)],
+    context: &mut Context,
+) -> JsResult<boa_engine::Module> {
+    use boa_engine::Module;
+    use boa_engine::module::SyntheticModuleInitializer;
+
+    let export_names: Vec<JsString> = methods
+        .iter()
+        .map(|(name, _)| js_string!(*name))
+        .chain(constants.iter().map(|(name, _)| js_string!(*name)))
+        .collect();
+
+    let initializer = SyntheticModuleInitializer::from_copy_closure(move |synthetic, ctx| {
+        for (name, method) in methods {
+            let function = FunctionObjectBuilder::new(
+                ctx.realm(),
+                boa_engine::NativeFunction::from_fn_ptr(*method),
+            )
+            .name(js_string!(*name))
+            .build();
+            synthetic.set_export(&js_string!(*name), function.into())?;
+        }
+        for (name, value) in constants {
+            synthetic.set_export(&js_string!(*name), JsValue::from(js_string!(*value)))?;
+        }
+        Ok(())
+    });
+
+    Ok(Module::synthetic(
+        &export_names,
+        initializer,
+        Some(std::path::PathBuf::from(format!("@std/{module_name}"))),
+        None,
+        context,
+    ))
 }
