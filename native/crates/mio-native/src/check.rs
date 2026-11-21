@@ -14,11 +14,11 @@ use crate::types::MachineType;
 /// 函数签名表：函数名 → (参数类型, 返回类型)。
 type Signatures<'a> = HashMap<&'a str, (&'a [crate::lower::Param], MachineType)>;
 
-/// 构造一个定位到函数声明行的 Check 期错误。
-fn err_at(func: &Func, path: &str, message: String) -> BuildError {
+/// 构造一个定位到函数声明行的 Check 期错误（位置取函数所属模块路径）。
+fn err_at(func: &Func, message: String) -> BuildError {
     BuildError {
         stage: Stage::Check,
-        path: String::from(path),
+        path: func.module_path.clone(),
         line: func.line,
         column: 1,
         message,
@@ -36,26 +36,22 @@ pub fn check(program: &Program) -> Result<(), BuildError> {
             .insert(f.name.as_str(), (f.params.as_slice(), f.ret))
             .is_some()
         {
-            return Err(err_at(
-                f,
-                &program.path,
-                format!("函数 {} 重复声明", f.name),
-            ));
+            return Err(err_at(f, format!("函数 {} 重复声明", f.name)));
         }
     }
     for f in &program.functions {
-        check_func(f, &sigs, &program.path)?;
+        check_func(f, &sigs)?;
     }
     Ok(())
 }
 
-fn check_func(f: &Func, sigs: &Signatures, path: &str) -> Result<(), BuildError> {
+fn check_func(f: &Func, sigs: &Signatures) -> Result<(), BuildError> {
     // 记录本函数内声明的变量类型，供表达式检查用。
     let mut vars: Vec<(String, MachineType)> = Vec::new();
     for p in &f.params {
         vars.push((p.name.clone(), p.ty));
     }
-    check_block(&f.body, &mut vars, f.ret, f, sigs, path)
+    check_block(&f.body, &mut vars, f.ret, f, sigs)
 }
 
 fn check_block(
@@ -64,10 +60,9 @@ fn check_block(
     ret: MachineType,
     func: &Func,
     sigs: &Signatures,
-    path: &str,
 ) -> Result<(), BuildError> {
     for s in body {
-        check_stmt(s, vars, ret, func, sigs, path)?;
+        check_stmt(s, vars, ret, func, sigs)?;
     }
     Ok(())
 }
@@ -78,15 +73,13 @@ fn check_stmt(
     ret: MachineType,
     func: &Func,
     sigs: &Signatures,
-    path: &str,
 ) -> Result<(), BuildError> {
     match s {
         Stmt::Let { name, ty, init } => {
-            let t = check_expr(init, vars, func, sigs, path)?;
+            let t = check_expr(init, vars, func, sigs)?;
             if t != *ty {
                 return Err(err_at(
                     func,
-                    path,
                     format!("初始化 {name} 的类型 {t:?} 与标注 {ty:?} 不一致（无隐式转换）"),
                 ));
             }
@@ -94,34 +87,29 @@ fn check_stmt(
             Ok(())
         }
         Stmt::Expr(e) => {
-            check_expr(e, vars, func, sigs, path)?;
+            check_expr(e, vars, func, sigs)?;
             Ok(())
         }
         Stmt::If { cond, then, els } => {
-            let t = check_expr(cond, vars, func, sigs, path)?;
+            let t = check_expr(cond, vars, func, sigs)?;
             if t != MachineType::Bool {
-                return Err(err_at(
-                    func,
-                    path,
-                    format!("if 条件必须为 boolean，得到 {t:?}"),
-                ));
+                return Err(err_at(func, format!("if 条件必须为 boolean，得到 {t:?}")));
             }
-            check_block(then, vars, ret, func, sigs, path)?;
+            check_block(then, vars, ret, func, sigs)?;
             if let Some(e) = els {
-                check_block(e, vars, ret, func, sigs, path)?;
+                check_block(e, vars, ret, func, sigs)?;
             }
             Ok(())
         }
         Stmt::While { cond, body } => {
-            let t = check_expr(cond, vars, func, sigs, path)?;
+            let t = check_expr(cond, vars, func, sigs)?;
             if t != MachineType::Bool {
                 return Err(err_at(
                     func,
-                    path,
                     format!("while 条件必须为 boolean，得到 {t:?}"),
                 ));
             }
-            check_block(body, vars, ret, func, sigs, path)
+            check_block(body, vars, ret, func, sigs)
         }
         Stmt::For {
             var,
@@ -131,42 +119,35 @@ fn check_stmt(
             step,
             body,
         } => {
-            let t = check_expr(init, vars, func, sigs, path)?;
+            let t = check_expr(init, vars, func, sigs)?;
             if t != *ty {
                 return Err(err_at(
                     func,
-                    path,
                     format!("for 变量 {var} 初始化类型 {t:?} 与标注 {ty:?} 不一致"),
                 ));
             }
             vars.push((var.clone(), *ty));
-            let c = check_expr(cond, vars, func, sigs, path)?;
+            let c = check_expr(cond, vars, func, sigs)?;
             if c != MachineType::Bool {
-                return Err(err_at(
-                    func,
-                    path,
-                    format!("for 条件必须为 boolean，得到 {c:?}"),
-                ));
+                return Err(err_at(func, format!("for 条件必须为 boolean，得到 {c:?}")));
             }
-            let s = check_expr(step, vars, func, sigs, path)?;
+            let s = check_expr(step, vars, func, sigs)?;
             if s != *ty {
                 return Err(err_at(
                     func,
-                    path,
                     format!("for 步进类型 {s:?} 与变量类型 {ty:?} 不一致"),
                 ));
             }
-            check_block(body, vars, ret, func, sigs, path)
+            check_block(body, vars, ret, func, sigs)
         }
         Stmt::Return(e) => {
             let t = match e {
-                Some(e) => check_expr(e, vars, func, sigs, path)?,
+                Some(e) => check_expr(e, vars, func, sigs)?,
                 None => MachineType::Void,
             };
             if t != ret {
                 return Err(err_at(
                     func,
-                    path,
                     format!("函数 {} 返回 {t:?}，与标注 {ret:?} 不一致", func.name),
                 ));
             }
@@ -181,7 +162,6 @@ fn check_expr(
     vars: &[(String, MachineType)],
     func: &Func,
     sigs: &Signatures,
-    path: &str,
 ) -> Result<MachineType, BuildError> {
     match e {
         Expr::Int { ty, .. } => Ok(*ty),
@@ -193,55 +173,40 @@ fn check_expr(
             } else {
                 Err(err_at(
                     func,
-                    path,
                     format!("函数 {} 中变量 {name} 未声明", func.name),
                 ))
             }
         }
         Expr::UnaryNeg(inner) => {
-            let t = check_expr(inner, vars, func, sigs, path)?;
+            let t = check_expr(inner, vars, func, sigs)?;
             if !t.is_integer() && !t.is_float() {
-                return Err(err_at(
-                    func,
-                    path,
-                    format!("一元负号只允许数值类型，得到 {t:?}"),
-                ));
+                return Err(err_at(func, format!("一元负号只允许数值类型，得到 {t:?}")));
             }
             Ok(t)
         }
         Expr::Not(inner) => {
-            let t = check_expr(inner, vars, func, sigs, path)?;
+            let t = check_expr(inner, vars, func, sigs)?;
             if t != MachineType::Bool {
-                return Err(err_at(
-                    func,
-                    path,
-                    format!("逻辑非只允许 boolean，得到 {t:?}"),
-                ));
+                return Err(err_at(func, format!("逻辑非只允许 boolean，得到 {t:?}")));
             }
             Ok(t)
         }
         Expr::Binary { op, lhs, rhs, ty } => {
-            let lt = check_expr(lhs, vars, func, sigs, path)?;
-            let rt = check_expr(rhs, vars, func, sigs, path)?;
+            let lt = check_expr(lhs, vars, func, sigs)?;
+            let rt = check_expr(rhs, vars, func, sigs)?;
             if lt != rt {
                 return Err(err_at(
                     func,
-                    path,
                     format!("二元运算两侧类型不一致：{lt:?} 与 {rt:?}（无隐式转换）"),
                 ));
             }
             let logic = matches!(op, BinOp::And | BinOp::Or);
             if logic && lt != MachineType::Bool {
-                return Err(err_at(
-                    func,
-                    path,
-                    format!("逻辑运算只允许 boolean，得到 {lt:?}"),
-                ));
+                return Err(err_at(func, format!("逻辑运算只允许 boolean，得到 {lt:?}")));
             }
             if !logic && !lt.is_integer() && !lt.is_float() {
                 return Err(err_at(
                     func,
-                    path,
                     format!("算术/比较运算只允许数值类型，得到 {lt:?}"),
                 ));
             }
@@ -249,7 +214,6 @@ fn check_expr(
             if *ty != lt {
                 return Err(err_at(
                     func,
-                    path,
                     format!("运算类型推断不一致：降低得 {ty:?}，检查得 {lt:?}"),
                 ));
             }
@@ -267,16 +231,15 @@ fn check_expr(
         Expr::Call { name, args, ty } => {
             if name == "print" {
                 if args.len() != 1 {
-                    return Err(err_at(func, path, String::from("print 只接受 1 个参数")));
+                    return Err(err_at(func, String::from("print 只接受 1 个参数")));
                 }
-                let t = check_expr(&args[0], vars, func, sigs, path)?;
+                let t = check_expr(&args[0], vars, func, sigs)?;
                 if t == MachineType::Void || t == MachineType::I8 || t == MachineType::U8 {
-                    return Err(err_at(func, path, format!("print 不支持类型 {t:?}")));
+                    return Err(err_at(func, format!("print 不支持类型 {t:?}")));
                 }
                 if *ty != MachineType::Void {
                     return Err(err_at(
                         func,
-                        path,
                         format!("print 的返回类型推断不一致：{ty:?} 与 Void"),
                     ));
                 }
@@ -284,12 +247,11 @@ fn check_expr(
             }
             // 用户函数：签名必须已声明，参数个数与类型逐一核对。
             let Some((params, ret)) = sigs.get(name.as_str()).copied() else {
-                return Err(err_at(func, path, format!("函数 {name} 未声明")));
+                return Err(err_at(func, format!("函数 {name} 未声明")));
             };
             if args.len() != params.len() {
                 return Err(err_at(
                     func,
-                    path,
                     format!(
                         "函数 {name} 期望 {} 个参数，得到 {} 个",
                         params.len(),
@@ -298,11 +260,10 @@ fn check_expr(
                 ));
             }
             for (index, arg) in args.iter().enumerate() {
-                let t = check_expr(arg, vars, func, sigs, path)?;
+                let t = check_expr(arg, vars, func, sigs)?;
                 if t != params[index].ty {
                     return Err(err_at(
                         func,
-                        path,
                         format!(
                             "函数 {name} 的参数 {} 类型 {t:?} 与标注 {:?} 不一致",
                             params[index].name, params[index].ty
@@ -313,7 +274,6 @@ fn check_expr(
             if *ty != ret {
                 return Err(err_at(
                     func,
-                    path,
                     format!("函数调用 {name} 的返回类型推断不一致：降低得 {ty:?}，签名得 {ret:?}"),
                 ));
             }
@@ -325,27 +285,24 @@ fn check_expr(
             els,
             ty,
         } => {
-            let ct = check_expr(cond, vars, func, sigs, path)?;
+            let ct = check_expr(cond, vars, func, sigs)?;
             if ct != MachineType::Bool {
                 return Err(err_at(
                     func,
-                    path,
                     format!("条件表达式必须为 boolean，得到 {ct:?}"),
                 ));
             }
-            let tt = check_expr(then, vars, func, sigs, path)?;
-            let et = check_expr(els, vars, func, sigs, path)?;
+            let tt = check_expr(then, vars, func, sigs)?;
+            let et = check_expr(els, vars, func, sigs)?;
             if tt != et {
                 return Err(err_at(
                     func,
-                    path,
                     format!("条件表达式两侧类型不一致：{tt:?} 与 {et:?}"),
                 ));
             }
             if *ty != tt {
                 return Err(err_at(
                     func,
-                    path,
                     format!("条件表达式类型推断不一致：{ty:?} 与 {tt:?}"),
                 ));
             }
@@ -353,18 +310,16 @@ fn check_expr(
         }
         // `as` 白名单：同符号整数扩宽、f32→f64。其余（缩窄、跨符号、数值↔浮点）一律拒绝。
         Expr::Cast { value, from, to } => {
-            let t = check_expr(value, vars, func, sigs, path)?;
+            let t = check_expr(value, vars, func, sigs)?;
             if t != *from {
                 return Err(err_at(
                     func,
-                    path,
                     format!("`as` 源类型推断不一致：降低得 {from:?}，检查得 {t:?}"),
                 ));
             }
             if !is_widening_cast(*from, *to) {
                 return Err(err_at(
                     func,
-                    path,
                     format!(
                         "`as` 只允许可证明安全的扩宽（同符号整数扩宽、f32→f64），{from:?} → {to:?} 不在白名单"
                     ),
@@ -373,18 +328,16 @@ fn check_expr(
             Ok(*to)
         }
         Expr::Assign { name, ty, value } => {
-            let t = check_expr(value, vars, func, sigs, path)?;
+            let t = check_expr(value, vars, func, sigs)?;
             if t != *ty {
                 return Err(err_at(
                     func,
-                    path,
                     format!("赋值 {name} 的类型 {t:?} 与标注 {ty:?} 不一致（无隐式转换）"),
                 ));
             }
             if !vars.iter().any(|(n, _)| n == name) {
                 return Err(err_at(
                     func,
-                    path,
                     format!("函数 {} 中变量 {name} 未声明", func.name),
                 ));
             }

@@ -16,6 +16,7 @@ mod emit;
 mod inline;
 mod lower;
 mod repr;
+mod resolve;
 mod types;
 
 pub use diag::{BuildError, Stage};
@@ -54,7 +55,10 @@ pub fn compile_source(
     out_path: &Path,
     emit_obj_only: bool,
 ) -> Result<(), BuildError> {
-    let program = lower::lower(src, src_path)?;
+    // 多文件：先展开 import 图（入口源码已在手，被引模块在 expand 内读盘）。
+    let modules =
+        resolve::expand(src_path, src).map_err(|e| BuildError::new(Stage::Lower, src_path, e))?;
+    let program = lower::lower_multi(&modules)?;
     check::check(&program)?;
     let program = inline::inline(program);
     let module =

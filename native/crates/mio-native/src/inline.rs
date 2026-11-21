@@ -63,6 +63,7 @@ pub fn inline(mut program: Program) -> Program {
                 params: func.params,
                 ret: func.ret,
                 line: func.line,
+                module_path: func.module_path.clone(),
                 body,
             });
         }
@@ -543,6 +544,8 @@ mod tests {
             }],
             ret: MachineType::I32,
             line: 1,
+
+            module_path: String::new(),
             body: vec![Stmt::Return(Some(Expr::Binary {
                 op: BinOp::Add,
                 lhs: Box::new(Expr::Var(String::from("a"), MachineType::I32)),
@@ -565,6 +568,8 @@ mod tests {
             }],
             ret: MachineType::I64,
             line: 1,
+
+            module_path: String::new(),
             body: vec![
                 Stmt::If {
                     cond: Expr::Binary {
@@ -593,6 +598,7 @@ mod tests {
             params: vec![],
             ret: MachineType::Void,
             line: 1,
+            module_path: String::new(),
             body,
         }
     }
@@ -689,6 +695,8 @@ mod tests {
                     }],
                     ret: MachineType::I64,
                     line: 1,
+
+                    module_path: String::new(),
                     body: vec![Stmt::Return(Some(Expr::Call {
                         name: String::from("fib"),
                         args: vec![Expr::Int {
@@ -719,6 +727,8 @@ mod tests {
                     }],
                     ret: MachineType::I64,
                     line: 1,
+
+                    module_path: String::new(),
                     body: vec![
                         Stmt::While {
                             cond: Expr::Bool(true),

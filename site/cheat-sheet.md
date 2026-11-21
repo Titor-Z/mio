@@ -167,5 +167,6 @@ function add(a: i64, b: i64): i64 { return a + b; }  // 必须带类型标注
 function main(): void { print(add(1, 2)); }          // 入口固定 main
 ```
 
-支持：机器类型（`i8..i64`/`u8..u64`/`f32`/`f64`/`bool`）、`if`/`while`/`for`、三元、`as` 扩宽、`print`。
-不支持：字符串、数组、对象、`class`、闭包、`import`、`switch`、复合赋值——需要时用 `mio run`。
+支持：机器类型（`i8..i64`/`u8..u64`/`f32`/`f64`/`bool`）、`if`/`while`/`for`/`do-while`、`switch`（穿透）、三元、`as` 扩宽、复合赋值（`+=` 等）、`print`。
+多文件：`import { abs } from "./util";`（相对路径、具名、扩展名可省；循环导入报错；`main` 只能在入口文件）。
+不支持：字符串、数组、对象、`class`、闭包、默认/命名空间导入——需要时用 `mio run`。

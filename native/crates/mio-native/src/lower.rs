@@ -8,6 +8,8 @@
 //! - 字面量类型取自期望类型（声明 / 形参 / 返回 / 运算符另一侧）；
 //! - 二元运算两侧类型必须一致；条件表达式两侧类型必须一致。
 //!
+//! 多文件：入口模块的函数名无前缀，被引模块为 `模块前缀::函数名`；
+//! Call 表达式按「导入绑定 → 本模块原名 → 模块前缀」顺序解析全局名。
 //! 错误统一为 [`BuildError`]：本阶段（Lower）的每个错误都带 OXC `Span`，
 //! 可精确到行列（由 `Ctx::err` 换算）。
 
@@ -15,6 +17,7 @@ use std::collections::HashMap;
 
 use crate::diag::{BuildError, Stage};
 use crate::repr::{self, Representation};
+use crate::resolve::ModuleSource;
 use crate::types::MachineType;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
@@ -36,6 +39,8 @@ pub struct Func {
     pub body: Block,
     /// 函数声明所在行（1 起始）：check 阶段的错误定位到该行。
     pub line: u32,
+    /// 函数所属模块路径（check 期错误的位置渲染用）。
+    pub module_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -142,10 +147,16 @@ pub enum BinOp {
     Or,
 }
 
-/// 降低期上下文：源码与路径用于错误定位。
+/// 降低期上下文：源码与路径用于错误定位；导入绑定与模块前缀用于
+/// Call 表达式的全局名解析（多文件降低期）。
 struct Ctx<'a> {
     src: &'a str,
     path: &'a str,
+    sigs: &'a HashMap<String, (Vec<Param>, MachineType)>,
+    /// 本模块的导入绑定：本地名 → 全局函数名。
+    bindings: &'a HashMap<String, String>,
+    /// 本模块的前缀（入口模块为空串）。
+    module_prefix: String,
 }
 
 impl Ctx<'_> {
@@ -161,68 +172,150 @@ impl Ctx<'_> {
     }
 }
 
-/// 降低入口：源码 → TIR。
+/// 多文件降低入口：模块图（已由 `resolve::expand` 展开）→ TIR。
 ///
-/// `path` 只用于诊断定位（不参与编译语义）。
+/// 单文件编译也走本函数（入口模块无 import，expand 返回单模块表）。
+///
+/// 两遍降低：先 parse 全部模块收集签名（全局名），再逐模块降低函数体。
+/// 每个模块各自 parse（oxc 的 AST 生命周期绑定局部 allocator，无法跨函数持有）。
 ///
 /// # Errors
-/// 语法错误、不支持的语法、缺失类型标注、类型不一致，均返回 `Err`。
-pub fn lower(src: &str, path: &str) -> Result<Program, BuildError> {
-    let allocator = Allocator::default();
-    let source_type = SourceType::default().with_typescript(true);
-    let ret = Parser::new(&allocator, src, source_type).parse();
-    if !ret.diagnostics.is_empty() {
-        // 解析诊断的位置取其主 label 的 span；labels 为空时退化为文件开头。
-        let offset = ret.diagnostics[0]
-            .labels
-            .first()
-            .map_or(0usize, |label| label.span().start as usize);
-        return Err(BuildError::at_offset(
-            Stage::Lower,
-            path,
-            src,
-            offset,
-            format!("语法错误：{}", ret.diagnostics[0]),
-        ));
-    }
-
-    let ctx = Ctx { src, path };
-
-    // 第一遍：收集全部函数签名。Call 表达式的类型在降低期就必须确定
-    // （二元运算的操作数类型互相传播），不能等 check 阶段。
+/// 同 [`lower`]，另加「导入名与本地函数冲突」。
+pub fn lower_multi(modules: &[ModuleSource]) -> Result<Program, BuildError> {
+    // 第一遍：签名收集（全局名 = 入口原名 / 被引 `前缀::原名`）。
     let mut sigs: HashMap<String, (Vec<Param>, MachineType)> = HashMap::new();
-    let mut raw: Vec<&Function> = Vec::new();
-    for stmt in &ret.program.body {
-        let f = match stmt {
-            Statement::FunctionDeclaration(f) => f,
-            _ => return Err(ctx.err(stmt.span(), "顶层只允许函数声明")),
-        };
-        let name =
-            f.id.as_ref()
-                .map(|id| id.name.as_str().to_string())
-                .ok_or_else(|| ctx.err(f.span(), "函数必须有名字"))?;
-        if sigs.insert(name.clone(), signature_of(&ctx, f)?).is_some() {
-            return Err(ctx.err(f.span(), format!("函数 {name} 重复声明")));
+    for m in modules {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, &m.src, source_type).parse();
+        if !ret.diagnostics.is_empty() {
+            return Err(BuildError::at_offset(
+                Stage::Lower,
+                &m.path,
+                &m.src,
+                ret.diagnostics[0]
+                    .labels
+                    .first()
+                    .map_or(0, |l| l.span().start as usize),
+                format!("语法错误：{}", ret.diagnostics[0]),
+            ));
         }
-        raw.push(f);
+        // 第一遍只需要错误定位（签名收集不查表），用空绑定构造轻量 ctx。
+        let empty_sigs: HashMap<String, (Vec<Param>, MachineType)> = HashMap::new();
+        let empty_bindings: HashMap<String, String> = HashMap::new();
+        let ctx = Ctx {
+            src: &m.src,
+            path: &m.path,
+            sigs: &empty_sigs,
+            bindings: &empty_bindings,
+            module_prefix: String::new(),
+        };
+        for stmt in &ret.program.body {
+            let f = match stmt {
+                Statement::FunctionDeclaration(f) => f,
+                // import 的形态校验在 resolve 期已完成，这里跳过。
+                Statement::ImportDeclaration(_) => continue,
+                _ => {
+                    return Err(ctx.err(stmt.span(), "顶层只允许函数声明与 import"));
+                }
+            };
+            let name =
+                f.id.as_ref()
+                    .map(|id| id.name.as_str().to_string())
+                    .ok_or_else(|| ctx.err(f.span(), "函数必须有名字"))?;
+            let global = global_name(m, &name);
+            if sigs.insert(global, signature_of(&ctx, f)?).is_some() {
+                return Err(ctx.err(f.span(), format!("函数 {name} 重复声明")));
+            }
+        }
     }
 
-    // 第二遍：降低函数体（此时签名表已完整）。
-    let mut funcs = Vec::new();
-    for f in raw {
-        funcs.push(lower_function(&ctx, f, &sigs)?);
+    // 入口模块的导入名不得与本地函数同名（TS 语义即冲突）。
+    let entry = modules.iter().find(|m| m.is_entry).expect("模块图必含入口");
+    for name in local_function_names(entry) {
+        if entry.bindings.contains_key(&name) {
+            return Err(BuildError::new(
+                Stage::Lower,
+                &entry.path,
+                format!("导入名 {name} 与本模块函数同名（不支持遮蔽）"),
+            ));
+        }
     }
+
+    // 第二遍：逐模块降低函数体。
+    let mut funcs = Vec::new();
+    for m in modules {
+        let allocator = Allocator::default();
+        let source_type = SourceType::default().with_typescript(true);
+        let ret = Parser::new(&allocator, &m.src, source_type).parse();
+        if !ret.diagnostics.is_empty() {
+            return Err(BuildError::at_offset(
+                Stage::Lower,
+                &m.path,
+                &m.src,
+                ret.diagnostics[0]
+                    .labels
+                    .first()
+                    .map_or(0, |l| l.span().start as usize),
+                format!("语法错误：{}", ret.diagnostics[0]),
+            ));
+        }
+        let ctx = Ctx {
+            src: &m.src,
+            path: &m.path,
+            sigs: &sigs,
+            bindings: &m.bindings,
+            module_prefix: m.prefix.clone(),
+        };
+        for stmt in &ret.program.body {
+            if let Statement::FunctionDeclaration(f) = stmt {
+                let name =
+                    f.id.as_ref()
+                        .map(|id| id.name.as_str().to_string())
+                        .ok_or_else(|| ctx.err(f.span(), "函数必须有名字"))?;
+                let global = global_name(m, &name);
+                funcs.push(lower_function(&ctx, f, &global)?);
+            }
+        }
+    }
+
     if funcs.iter().all(|f| f.name != "main") {
         return Err(BuildError::new(
             Stage::Lower,
-            path,
+            &entry.path,
             String::from("缺少入口函数 main"),
         ));
     }
     Ok(Program {
         functions: funcs,
-        path: String::from(path),
+        path: String::from(&entry.path),
     })
+}
+
+/// 模块内函数的原名表（入口冲突校验用）。
+fn local_function_names(m: &ModuleSource) -> Vec<String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(true);
+    let ret = Parser::new(&allocator, &m.src, source_type).parse();
+    ret.program
+        .body
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Statement::FunctionDeclaration(f) => {
+                f.id.as_ref().map(|id| id.name.as_str().to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// 函数的全局名：入口模块用原名，被引模块加 `前缀::`。
+fn global_name(m: &ModuleSource, local: &str) -> String {
+    if m.is_entry {
+        String::from(local)
+    } else {
+        format!("{}::{}", m.prefix, local)
+    }
 }
 
 /// 从 AST 函数声明提取签名（参数名+类型、返回类型）。
@@ -254,11 +347,7 @@ fn signature_of(ctx: &Ctx, f: &Function) -> Result<(Vec<Param>, MachineType), Bu
     Ok((params, ret))
 }
 
-fn lower_function(
-    ctx: &Ctx,
-    f: &Function,
-    sigs: &HashMap<String, (Vec<Param>, MachineType)>,
-) -> Result<Func, BuildError> {
+fn lower_function(ctx: &Ctx, f: &Function, global: &str) -> Result<Func, BuildError> {
     let name =
         f.id.as_ref()
             .map(|id| id.name.as_str().to_string())
@@ -290,15 +379,16 @@ fn lower_function(
             for p in &params {
                 scope.vars.insert(p.name.clone(), p.ty);
             }
-            lower_statements_with(ctx, &b.statements, &mut scope, sigs)?
+            lower_statements_with(ctx, &b.statements, &mut scope)?
         }
         None => return Err(ctx.err(f.span(), format!("函数 {name} 必须有函数体"))),
     };
     Ok(Func {
-        name,
+        name: String::from(global),
         params,
         ret,
         line: line_of(ctx.src, f.span().start as usize),
+        module_path: String::from(ctx.path),
         body,
     })
 }
@@ -331,11 +421,10 @@ fn lower_statements_with(
     ctx: &Ctx,
     stmts: &[Statement],
     scope: &mut Scope,
-    sigs: &HashMap<String, (Vec<Param>, MachineType)>,
 ) -> Result<Block, BuildError> {
     let mut out = Vec::new();
     for s in stmts {
-        lower_stmt(ctx, s, scope, sigs, &mut out)?;
+        lower_stmt(ctx, s, scope, &mut out)?;
     }
     Ok(out)
 }
@@ -349,7 +438,6 @@ fn lower_stmt(
     ctx: &Ctx,
     s: &Statement,
     scope: &mut Scope,
-    sigs: &HashMap<String, (Vec<Param>, MachineType)>,
     out: &mut Block,
 ) -> Result<(), BuildError> {
     match s {
@@ -366,7 +454,6 @@ fn lower_stmt(
                     .ok_or_else(|| {
                         ctx.err(d.id.span(), format!("变量 {} 必须有类型标注", id.name))
                     })?;
-                let mt = ty;
                 let init = d.init.as_ref().ok_or_else(|| {
                     ctx.err(
                         d.span(),
@@ -376,28 +463,28 @@ fn lower_stmt(
                         ),
                     )
                 })?;
-                let e = lower_expr(ctx, init, scope, Some(mt), sigs)?;
-                scope.vars.insert(id.name.as_str().to_string(), mt);
+                let e = lower_expr(ctx, init, scope, Some(ty))?;
+                scope.vars.insert(id.name.as_str().to_string(), ty);
                 out.push(Stmt::Let {
                     name: id.name.as_str().to_string(),
-                    ty: mt,
+                    ty,
                     init: e,
                 });
             }
             Ok(())
         }
         Statement::ExpressionStatement(es) => {
-            let e = lower_expr(ctx, &es.expression, scope, None, sigs)?;
+            let e = lower_expr(ctx, &es.expression, scope, None)?;
             out.push(Stmt::Expr(e));
             Ok(())
         }
         Statement::IfStatement(i) => {
-            let cond = lower_expr(ctx, &i.test, scope, Some(MachineType::Bool), sigs)?;
+            let cond = lower_expr(ctx, &i.test, scope, Some(MachineType::Bool))?;
             let then = match &i.consequent {
-                Statement::BlockStatement(b) => lower_statements_with(ctx, &b.body, scope, sigs)?,
+                Statement::BlockStatement(b) => lower_statements_with(ctx, &b.body, scope)?,
                 other => {
                     let mut v = Vec::new();
-                    lower_stmt(ctx, other, scope, sigs, &mut v)?;
+                    lower_stmt(ctx, other, scope, &mut v)?;
                     v
                 }
             };
@@ -406,11 +493,11 @@ fn lower_stmt(
                 Some(Statement::IfStatement(_)) => {
                     let alt = i.alternate.as_ref().unwrap();
                     let mut inner = Vec::new();
-                    lower_stmt(ctx, alt, scope, sigs, &mut inner)?;
+                    lower_stmt(ctx, alt, scope, &mut inner)?;
                     Some(inner)
                 }
                 Some(Statement::BlockStatement(b)) => {
-                    Some(lower_statements_with(ctx, &b.body, scope, sigs)?)
+                    Some(lower_statements_with(ctx, &b.body, scope)?)
                 }
                 Some(other) => {
                     return Err(ctx.err(
@@ -424,16 +511,39 @@ fn lower_stmt(
             Ok(())
         }
         Statement::WhileStatement(w) => {
-            let cond = lower_expr(ctx, &w.test, scope, Some(MachineType::Bool), sigs)?;
+            let cond = lower_expr(ctx, &w.test, scope, Some(MachineType::Bool))?;
             let body = match &w.body {
-                Statement::BlockStatement(b) => lower_statements_with(ctx, &b.body, scope, sigs)?,
+                Statement::BlockStatement(b) => lower_statements_with(ctx, &b.body, scope)?,
                 other => {
                     let mut v = Vec::new();
-                    lower_stmt(ctx, other, scope, sigs, &mut v)?;
+                    lower_stmt(ctx, other, scope, &mut v)?;
                     v
                 }
             };
             out.push(Stmt::While { cond, body });
+            Ok(())
+        }
+        // do-while desugar 为「死循环 + 条件不满足时 break」：体在条件前执行，语义等价。
+        Statement::DoWhileStatement(d) => {
+            let body = match &d.body {
+                Statement::BlockStatement(b) => lower_statements_with(ctx, &b.body, scope)?,
+                other => {
+                    let mut v = Vec::new();
+                    lower_stmt(ctx, other, scope, &mut v)?;
+                    v
+                }
+            };
+            let cond = lower_expr(ctx, &d.test, scope, Some(MachineType::Bool))?;
+            let mut desugared = body;
+            desugared.push(Stmt::If {
+                cond: Expr::Not(Box::new(cond)),
+                then: vec![Stmt::Break],
+                els: None,
+            });
+            out.push(Stmt::While {
+                cond: Expr::Bool(true),
+                body: desugared,
+            });
             Ok(())
         }
         Statement::ForStatement(f) => {
@@ -457,27 +567,27 @@ fn lower_stmt(
                         .init
                         .as_ref()
                         .ok_or_else(|| ctx.err(d.span(), "for 变量必须有初始化式"))?;
-                    let e = lower_expr(ctx, e, scope, Some(ty), sigs)?;
+                    let e = lower_expr(ctx, e, scope, Some(ty))?;
                     scope.vars.insert(id.name.as_str().to_string(), ty);
                     (id.name.as_str().to_string(), ty, e)
                 }
                 _ => return Err(ctx.err(f.span(), "for 初始化只支持带类型标注的变量声明")),
             };
             let cond = match &f.test {
-                Some(e) => lower_expr(ctx, e, scope, Some(MachineType::Bool), sigs)?,
+                Some(e) => lower_expr(ctx, e, scope, Some(MachineType::Bool))?,
                 None => {
                     return Err(ctx.err(f.span(), "for 必须有循环条件（本阶段不支持无限循环）"));
                 }
             };
             let step = match &f.update {
-                Some(e) => lower_expr(ctx, e, scope, Some(ty), sigs)?,
+                Some(e) => lower_expr(ctx, e, scope, Some(ty))?,
                 None => return Err(ctx.err(f.span(), "for 必须有步进表达式")),
             };
             let body = match &f.body {
-                Statement::BlockStatement(b) => lower_statements_with(ctx, &b.body, scope, sigs)?,
+                Statement::BlockStatement(b) => lower_statements_with(ctx, &b.body, scope)?,
                 other => {
                     let mut v = Vec::new();
-                    lower_stmt(ctx, other, scope, sigs, &mut v)?;
+                    lower_stmt(ctx, other, scope, &mut v)?;
                     v
                 }
             };
@@ -491,9 +601,114 @@ fn lower_stmt(
             });
             Ok(())
         }
+        // switch desugar 为 if-else 链：连续无 break/return 结尾的 case 合并为一组
+        // （穿透语义）；末尾 break 丢弃（if 块结束即跳出）；非末尾 break 拒绝。
+        // oxc 的 SwitchCase 以 `test: Option<Expression>` 区分 case 与 default。
+        Statement::SwitchStatement(sw) => {
+            let disc = lower_expr(ctx, &sw.discriminant, scope, None)?;
+            let disc_ty = expr_type(&disc)
+                .ok_or_else(|| ctx.err(sw.span(), "switch 判别式无法确定类型（请加类型标注）"))?;
+            let mut groups: Vec<(Vec<Expr>, Block)> = Vec::new();
+            let mut conds: Vec<Expr> = Vec::new();
+            let mut body: Block = Vec::new();
+            let mut terminated = true;
+            let mut default_body: Option<Block> = None;
+            let case_count = sw.cases.len();
+            for (index, clause) in sw.cases.iter().enumerate() {
+                match &clause.test {
+                    Some(test) => {
+                        // case 条件 desugar 为「判别式 == 表达式」（与用户手写比较同构，
+                        // ty 标操作数类型——check 期比较运算的结果类型修正为 Bool）。
+                        let case_expr = lower_expr(ctx, test, scope, Some(disc_ty))?;
+                        let cond = Expr::Binary {
+                            op: BinOp::Eq,
+                            lhs: Box::new(disc.clone()),
+                            rhs: Box::new(case_expr),
+                            ty: disc_ty,
+                        };
+                        if terminated {
+                            // 上一组已结束：先结算，再开新组。
+                            if !conds.is_empty() {
+                                groups
+                                    .push((std::mem::take(&mut conds), std::mem::take(&mut body)));
+                            }
+                            conds.push(cond);
+                        } else {
+                            // 穿透：与上一组同条件分支。
+                            conds.push(cond);
+                        }
+                        terminated = false;
+                        let n = clause.consequent.len();
+                        for (i, st) in clause.consequent.iter().enumerate() {
+                            if let Statement::BreakStatement(_) = st {
+                                if i + 1 != n {
+                                    return Err(ctx.err(
+                                        st.span(),
+                                        "switch 内 break 只支持出现在 case 体末尾",
+                                    ));
+                                }
+                                terminated = true;
+                                continue;
+                            }
+                            lower_stmt(ctx, st, scope, &mut body)?;
+                        }
+                        // 体以 return 结尾同样终止本组（return 保留在体内）。
+                        if matches!(body.last(), Some(Stmt::Return(_))) {
+                            terminated = true;
+                        }
+                    }
+                    None => {
+                        // default：只允许出现在末尾，其体作为 else 分支。
+                        if index + 1 != case_count {
+                            return Err(ctx.err(
+                                clause.span(),
+                                "default 只支持出现在 switch 末尾（本阶段限制）",
+                            ));
+                        }
+                        let mut default_block = Vec::new();
+                        for st in &clause.consequent {
+                            if let Statement::BreakStatement(_) = st {
+                                continue;
+                            }
+                            lower_stmt(ctx, st, scope, &mut default_block)?;
+                        }
+                        default_body = Some(default_block);
+                    }
+                }
+            }
+            if !conds.is_empty() {
+                groups.push((conds, body));
+            }
+            // 从后往前渲染 if-else 链。
+            let mut els: Option<Block> = default_body;
+            for (group_conds, group_body) in groups.iter().rev() {
+                let mut iter = group_conds.iter();
+                let first = iter
+                    .next()
+                    .ok_or_else(|| ctx.err(sw.span(), "switch 组缺少条件"))?
+                    .clone();
+                let cond = iter.fold(first, |acc, c| Expr::Binary {
+                    op: BinOp::Or,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(c.clone()),
+                    ty: MachineType::Bool,
+                });
+                let if_stmt = Stmt::If {
+                    cond,
+                    then: group_body.clone(),
+                    els: els.take(),
+                };
+                els = Some(vec![if_stmt]);
+            }
+            // 无任何 case（空 switch）：不生成语句。
+            if let Some(stmts) = els {
+                out.extend(stmts);
+            }
+            Ok(())
+        }
         Statement::ReturnStatement(r) => {
             let e = match &r.argument {
-                Some(e) => Some(lower_expr(ctx, e, scope, None, sigs)?),
+                Some(e) => Some(lower_expr(ctx, e, scope, None)?),
                 None => None,
             };
             out.push(Stmt::Return(e));
@@ -508,7 +723,7 @@ fn lower_stmt(
             Ok(())
         }
         Statement::BlockStatement(b) => {
-            let inner = lower_statements_with(ctx, &b.body, scope, sigs)?;
+            let inner = lower_statements_with(ctx, &b.body, scope)?;
             out.extend(inner);
             Ok(())
         }
@@ -522,7 +737,6 @@ fn lower_expr(
     e: &Expression,
     scope: &Scope,
     expected: Option<MachineType>,
-    sigs: &HashMap<String, (Vec<Param>, MachineType)>,
 ) -> Result<Expr, BuildError> {
     match e {
         Expression::NumericLiteral(n) => {
@@ -575,7 +789,7 @@ fn lower_expr(
             Ok(Expr::Var(id.name.as_str().to_string(), ty))
         }
         Expression::UnaryExpression(u) => {
-            let inner = lower_expr(ctx, &u.argument, scope, expected, sigs)?;
+            let inner = lower_expr(ctx, &u.argument, scope, expected)?;
             match u.operator {
                 UnaryOperator::UnaryNegation => Ok(Expr::UnaryNeg(Box::new(inner))),
                 UnaryOperator::LogicalNot => Ok(Expr::Not(Box::new(inner))),
@@ -583,8 +797,8 @@ fn lower_expr(
             }
         }
         Expression::LogicalExpression(l) => {
-            let lhs = lower_expr(ctx, &l.left, scope, Some(MachineType::Bool), sigs)?;
-            let rhs = lower_expr(ctx, &l.right, scope, Some(MachineType::Bool), sigs)?;
+            let lhs = lower_expr(ctx, &l.left, scope, Some(MachineType::Bool))?;
+            let rhs = lower_expr(ctx, &l.right, scope, Some(MachineType::Bool))?;
             let op = match l.operator {
                 LogicalOperator::And => BinOp::And,
                 LogicalOperator::Or => BinOp::Or,
@@ -608,8 +822,8 @@ fn lower_expr(
                 Some(MachineType::Bool) => None,
                 other => other,
             };
-            let lhs = lower_expr(ctx, &b.left, scope, lhs_expected, sigs)?;
-            let rhs = lower_expr(ctx, &b.right, scope, expr_type(&lhs), sigs)?;
+            let lhs = lower_expr(ctx, &b.left, scope, lhs_expected)?;
+            let rhs = lower_expr(ctx, &b.right, scope, expr_type(&lhs))?;
             let ty = expr_type(&lhs).or(expr_type(&rhs)).ok_or_else(|| {
                 ctx.err(b.span(), "二元运算无法确定操作数类型（请为变量加类型标注）")
             })?;
@@ -622,9 +836,9 @@ fn lower_expr(
             })
         }
         Expression::ConditionalExpression(c) => {
-            let cond = lower_expr(ctx, &c.test, scope, Some(MachineType::Bool), sigs)?;
-            let then = lower_expr(ctx, &c.consequent, scope, expected, sigs)?;
-            let els = lower_expr(ctx, &c.alternate, scope, expected, sigs)?;
+            let cond = lower_expr(ctx, &c.test, scope, Some(MachineType::Bool))?;
+            let then = lower_expr(ctx, &c.consequent, scope, expected)?;
+            let els = lower_expr(ctx, &c.alternate, scope, expected)?;
             let ty = expr_type(&then).ok_or_else(|| ctx.err(c.span(), "条件表达式无法确定类型"))?;
             Ok(Expr::Cond {
                 cond: Box::new(cond),
@@ -642,6 +856,13 @@ fn lower_expr(
                     );
                 }
             };
+            // 内建 print：固定 void，接受任意数值实参。
+            let is_print = callee == "print";
+            let global = if is_print {
+                String::from("print")
+            } else {
+                resolve_callee(ctx, &callee, c.span())?
+            };
             let mut args = Vec::new();
             for (index, a) in c.arguments.iter().enumerate() {
                 match a {
@@ -650,46 +871,39 @@ fn lower_expr(
                     }
                     other => {
                         // 实参服从形参类型（print 除外：它接受任意数值实参）。
-                        let arg_expected = if callee == "print" {
+                        let arg_expected = if is_print {
                             None
                         } else {
-                            sigs.get(&callee)
+                            ctx.sigs
+                                .get(&global)
                                 .and_then(|(params, _)| params.get(index))
                                 .map(|p| p.ty)
                         };
-                        args.push(lower_expr(
-                            ctx,
-                            other.to_expression(),
-                            scope,
-                            arg_expected,
-                            sigs,
-                        )?)
+                        args.push(lower_expr(ctx, other.to_expression(), scope, arg_expected)?)
                     }
                 }
             }
             // 返回类型：print 固定 void；用户函数查签名表（两遍降低保证表已完整）。
-            let ty = if callee == "print" {
+            let ty = if is_print {
                 MachineType::Void
             } else {
-                match sigs.get(&callee) {
+                match ctx.sigs.get(&global) {
                     Some((_, ret)) => *ret,
                     None => return Err(ctx.err(c.span(), format!("函数 {callee} 未声明"))),
                 }
             };
             Ok(Expr::Call {
-                name: callee,
+                name: global,
                 args,
                 ty,
             })
         }
         // 括号在 TIR 层无意义，直接解包递归降低。
-        Expression::ParenthesizedExpression(p) => {
-            lower_expr(ctx, &p.expression, scope, expected, sigs)
-        }
+        Expression::ParenthesizedExpression(p) => lower_expr(ctx, &p.expression, scope, expected),
         // `as`：仅允许「可证明安全」的扩宽子集，语义校验在 check 阶段；
         // 降低阶段只做「源类型已知 + 目标类型可表示」两件事。
         Expression::TSAsExpression(a) => {
-            let value = lower_expr(ctx, &a.expression, scope, None, sigs)?;
+            let value = lower_expr(ctx, &a.expression, scope, None)?;
             let from = expr_type(&value).ok_or_else(|| {
                 ctx.err(
                     a.span(),
@@ -704,10 +918,8 @@ fn lower_expr(
             })
         }
         // 赋值是表达式：`i = i + 1` 与 `i++` 都归到这里。
+        // 复合赋值（+= 等）在此 desugar 为「读取 + 运算 + 写回」。
         Expression::AssignmentExpression(a) => {
-            if a.operator != AssignmentOperator::Assign {
-                return Err(ctx.err(a.span(), "本阶段只支持 `=` 赋值（复合赋值请展开写）"));
-            }
             let Some(SimpleAssignmentTarget::AssignmentTargetIdentifier(id)) =
                 a.left.as_simple_assignment_target()
             else {
@@ -718,7 +930,33 @@ fn lower_expr(
                 .get(id.name.as_str())
                 .copied()
                 .ok_or_else(|| ctx.err(id.span(), format!("变量 {} 未声明", id.name)))?;
-            let value = lower_expr(ctx, &a.right, scope, Some(ty), sigs)?;
+            let op = match a.operator {
+                AssignmentOperator::Assign => None,
+                AssignmentOperator::Addition => Some(BinOp::Add),
+                AssignmentOperator::Subtraction => Some(BinOp::Sub),
+                AssignmentOperator::Multiplication => Some(BinOp::Mul),
+                AssignmentOperator::Division => Some(BinOp::Div),
+                AssignmentOperator::Remainder => Some(BinOp::Rem),
+                _ => {
+                    return Err(ctx.err(
+                        a.span(),
+                        "只支持 += -= *= /= %=（位运算与逻辑赋值本阶段不支持）",
+                    ));
+                }
+            };
+            let value = match op {
+                None => lower_expr(ctx, &a.right, scope, Some(ty))?,
+                Some(op) => {
+                    // a op= b desugar 为 a = a op b（a 的类型即目标类型）。
+                    let rhs = lower_expr(ctx, &a.right, scope, Some(ty))?;
+                    Expr::Binary {
+                        op,
+                        lhs: Box::new(Expr::Var(id.name.as_str().to_string(), ty)),
+                        rhs: Box::new(rhs),
+                        ty,
+                    }
+                }
+            };
             Ok(Expr::Assign {
                 name: id.name.as_str().to_string(),
                 ty,
@@ -769,6 +1007,23 @@ fn lower_expr(
         }
         other => Err(ctx.err(other.span(), format!("本阶段不支持该表达式：{other:?}"))),
     }
+}
+
+/// Call 表达式的被调名解析（多文件）：导入绑定 → 本模块原名 → 模块前缀。
+fn resolve_callee(ctx: &Ctx, local: &str, span: Span) -> Result<String, BuildError> {
+    if let Some(global) = ctx.bindings.get(local) {
+        return Ok(global.clone());
+    }
+    if ctx.sigs.contains_key(local) {
+        return Ok(String::from(local));
+    }
+    if !ctx.module_prefix.is_empty() {
+        let prefixed = format!("{}::{local}", ctx.module_prefix);
+        if ctx.sigs.contains_key(&prefixed) {
+            return Ok(prefixed);
+        }
+    }
+    Err(ctx.err(span, format!("函数 {local} 未声明")))
 }
 
 fn map_binop(op: BinaryOperator) -> Result<BinOp, String> {

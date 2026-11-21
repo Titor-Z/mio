@@ -188,6 +188,90 @@ fn check_error_points_to_function_declaration_line() {
 }
 
 #[test]
+fn multi_file_import_builds_and_runs() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("{reason}");
+        return;
+    }
+    let dir = workspace("multi_import");
+    write(
+        &dir,
+        "util.ts",
+        "function abs(x: i64): i64 {\n\
+         \x20 if (x < 0) {\n\
+         \x20   return -x;\n\
+         \x20 }\n\
+         \x20 return x;\n\
+         }\n",
+    );
+    write(
+        &dir,
+        "app.ts",
+        "import { abs } from \"./util\";\n\
+         function main(): void {\n\
+         \x20 let sum: i64 = 0;\n\
+         \x20 for (let i: i64 = -3; i <= 3; i = i + 1) {\n\
+         \x20   let a: i64 = abs(i);\n\
+         \x20   sum = sum + a;\n\
+         \x20 }\n\
+         \x20 print(sum);\n\
+         }\n",
+    );
+
+    let build = run_mio(&dir, &["build", "app.ts", "-o", "app"]);
+    let text = combined(&build);
+    assert!(build.status.success(), "多文件构建应成功：{text}");
+    let run = Command::new(dir.join("app"))
+        .output()
+        .expect("应能执行产物");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(stdout.trim(), "12", "产物输出应为 |i| 之和（-3..=3）");
+}
+
+#[test]
+fn import_cycle_is_rejected() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("{reason}");
+        return;
+    }
+    let dir = workspace("multi_cycle");
+    write(
+        &dir,
+        "a.ts",
+        "import { b } from \"./b\";\nfunction a(): void { b(); }\nfunction main(): void { a(); }\n",
+    );
+    write(
+        &dir,
+        "b.ts",
+        "import { a } from \"./a\";\nfunction b(): void { a(); }\n",
+    );
+
+    let build = run_mio(&dir, &["build", "a.ts", "-o", "a"]);
+    let text = combined(&build);
+    assert!(!build.status.success(), "循环导入应失败：{text}");
+    assert!(text.contains("循环导入"), "应说明循环导入：{text}");
+}
+
+#[test]
+fn import_bare_specifier_is_rejected() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("{reason}");
+        return;
+    }
+    let dir = workspace("multi_bare");
+    write(
+        &dir,
+        "app.ts",
+        "import { f } from \"some-pkg\";\nfunction main(): void { f(); }\n",
+    );
+
+    let build = run_mio(&dir, &["build", "app.ts", "-o", "app"]);
+    let text = combined(&build);
+    assert!(!build.status.success(), "裸包名应失败：{text}");
+    assert!(text.contains("相对路径"), "应说明只支持相对路径：{text}");
+}
+
+#[test]
 fn build_only_options_rejected_on_other_commands() {
     let dir = workspace("bad_flag");
     let output = run_mio(&dir, &["run", "app.ts", "-o", "x"]);

@@ -195,6 +195,56 @@ pub const CASES: &[(&str, &str, &str)] = &[
          }\n",
         "3\n",
     ),
+    // switch desugar：case 穿透合并、default 兜底。
+    (
+        "switch-fallthrough",
+        "function classify(n: i32): i32 {\n\
+         \x20 let r: i32 = 0;\n\
+         \x20 switch (n) {\n\
+         \x20   case 1:\n\
+         \x20     r = 10;\n\
+         \x20     break;\n\
+         \x20   case 2:\n\
+         \x20   case 3:\n\
+         \x20     r = 20;\n\
+         \x20     break;\n\
+         \x20   default:\n\
+         \x20     r = 99;\n\
+         \x20 }\n\
+         \x20 return r;\n\
+         }\n\
+         function main(): void {\n\
+         \x20 print(classify(1));\n\
+         \x20 print(classify(3));\n\
+         \x20 print(classify(7));\n\
+         }\n",
+        "10\n20\n99\n",
+    ),
+    // do-while desugar：体在条件前执行。
+    (
+        "do-while",
+        "function main(): void {\n\
+         \x20 let i: i64 = 0;\n\
+         \x20 let acc: i64 = 0;\n\
+         \x20 do {\n\
+         \x20   acc = acc + i;\n\
+         \x20   i = i + 1;\n\
+         \x20 } while (i < 5);\n\
+         \x20 print(acc);\n\
+         }\n",
+        "10\n",
+    ),
+    // 复合赋值 desugar：+= 与 *=。
+    (
+        "compound-assign",
+        "function main(): void {\n\
+         \x20 let x: i64 = 5;\n\
+         \x20 x += 3;\n\
+         \x20 x *= 2;\n\
+         \x20 print(x);\n\
+         }\n",
+        "16\n",
+    ),
     // 嵌套语境（print 的实参是调用）不展开，函数定义保留，输出不变。
     (
         "inline-nested-kept",
@@ -251,6 +301,50 @@ pub const REJECTED: &[(&str, &str, &str)] = &[
         "float-rem",
         "function main(): void {\n  let a: f64 = 1.0;\n  let b: f64 = a % 2.0;\n  print(b);\n}\n",
         "浮点取余",
+    ),
+    // switch 内非末尾 break 拒绝。
+    (
+        "switch-mid-break",
+        "function main(): void {\n\
+         \x20 let n: i32 = 1;\n\
+         \x20 let r: i32 = 0;\n\
+         \x20 switch (n) {\n\
+         \x20   case 1:\n\
+         \x20     r = 10;\n\
+         \x20     break;\n\
+         \x20     r = 11;\n\
+         \x20 }\n\
+         \x20 print(r);\n\
+         }\n",
+        "末尾",
+    ),
+    // default 不在末尾拒绝。
+    (
+        "default-mid",
+        "function main(): void {\n\
+         \x20 let n: i32 = 1;\n\
+         \x20 let r: i32 = 0;\n\
+         \x20 switch (n) {\n\
+         \x20   default:\n\
+         \x20     r = 99;\n\
+         \x20     break;\n\
+         \x20   case 1:\n\
+         \x20     r = 10;\n\
+         \x20     break;\n\
+         \x20 }\n\
+         \x20 print(r);\n\
+         }\n",
+        "default 只支持出现在 switch 末尾",
+    ),
+    // 位运算复合赋值不支持。
+    (
+        "compound-bitwise",
+        "function main(): void {\n\
+         \x20 let x: i32 = 1;\n\
+         \x20 x &= 2;\n\
+         \x20 print(x);\n\
+         }\n",
+        "只支持 +=",
     ),
     // 字符串不支持（MVP 无堆）。
     (
