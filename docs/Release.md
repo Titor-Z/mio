@@ -7,6 +7,27 @@ TodoID 规则：`TD` + UUID。TaolunID 规则：`TL` + `YYYYMMDDThhmmss`。
 
 ---
 
+## 0.2.2（2026-11-21）
+
+**状态**：已发布。
+
+**更新内容**
+
+- `mio init` 生成的 `tsconfig.json` 增加 `"moduleDetection": "force"`，与运行语义对齐：运行期与 `mio check` 都把每个文件当 ES Module，顶层 `await` 因此合法；缺这一行时，没有 import/export 的文件会被编辑器当成脚本，导致顶层 `await` 被误报。
+- `mio init` 仍遵守「已存在配置不覆盖」，老项目需手工补该字段，或在文件末尾加 `export {}`（手册常见问题已写明）。
+- 手册同步：生成的 tsconfig 片段展示该字段并补迁移说明。
+- 本版本为补丁修复，无 API 变更。
+
+**TodoLists[]**
+
+- TD5a13237b8a0f4a22a7dadb631c06c727（生成的 tsconfig 补 `moduleDetection`）
+
+**关联讨论**
+
+- TL20261121T182811
+
+---
+
 ## 0.2.1（2026-11-09）
 
 **状态**：已发布。

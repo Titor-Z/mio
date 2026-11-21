@@ -3,6 +3,14 @@
 本文件只保留最新一个版本的发布说明，供 GitHub Actions 生成 release 使用。
 历史版本记录见 `docs/Release.md`。
 
+## 0.2.2
+
+### 修复
+
+- `mio init` 生成的 `tsconfig.json` 增加 `"moduleDetection": "force"`：运行期把每个文件都当 ES Module，顶层 `await` 因此合法；缺失这一行时，没有 import/export 的文件会被编辑器当成脚本，导致顶层 `await` 被误报。老项目需手工补上（`mio init` 不覆盖已有配置），或在文件末尾加 `export {}`。
+
+手册同步：`mio init` 生成的 tsconfig 片段展示该字段，常见问题新增「编辑器把顶层 `await` 标红」的两种迁移方式。
+
 ## 0.2.1
 
 ### 高性能文件系统 `@std/fs`

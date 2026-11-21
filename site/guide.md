@@ -43,6 +43,7 @@ mio init
 {
   "compilerOptions": {
     "lib": ["ESNext"],              // 不要 DOM
+    "moduleDetection": "force",     // 每个文件都按模块检查，顶层 await 因此合法
     "typeRoots": [".mio/@types"],
     "types": ["mio"]
   },
@@ -325,6 +326,13 @@ mio docs 0.0.0.0:8080     # 指定监听地址
 A: mio 是后端运行时，没有浏览器环境。请确保：
 1. 不要在代码中使用 `window`, `document` 等 DOM API
 2. `tsconfig.json` 中不要添加 `"lib": ["dom"]`
+
+### Q: 为什么编辑器把顶层 `await` 标红（`'await' expressions are only allowed at the top level ... this file has no imports or exports`）？
+
+A: 编辑器默认的判断是「文件里有 import/export 才算模块」，而 mio 运行期把每个文件都当模块，顶层 `await` 一直可用。两个办法任选其一：
+
+1. 在 `tsconfig.json` 的 `compilerOptions` 里加 `"moduleDetection": "force"`（`mio init` 新生成的项目已含这一行，老项目需手改一次）
+2. 在文件末尾加一行 `export {}`
 
 ### Q: 为什么 `@std/*` 模块（如 `@std/path`、`@std/fs`）找不到？
 

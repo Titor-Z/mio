@@ -32,11 +32,17 @@ const MIO_JSON: &str = r#"{
 "#;
 
 /// 初始化生成的编辑器配置。只服务于 TypeScript LSP，不参与运行。
+/// 其中模块相关选项必须与运行语义对齐：`mio check` 传的就是
+/// `--moduleDetection force --target esnext --module esnext`。
 const TSCONFIG: &str = r#"{
   // 由 mio init 生成：仅供编辑器类型提示，运行配置以 mio.json 为准。
   "compilerOptions": {
     "target": "ESNext",
     "module": "ESNext",
+    // 关键：与 mio check 的 --moduleDetection force 对齐（运行期把每个文件都当 ES Module，
+    // 顶层 await 因此合法）；编辑器默认的 auto 只认有 import/export 的文件，
+    // 会把只有顶层 await 的文件当脚本报错。
+    "moduleDetection": "force",
     "moduleResolution": "bundler",
     // 关键：不要 DOM，mio 没有 window/document
     "lib": ["ESNext"],

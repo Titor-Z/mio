@@ -152,3 +152,45 @@ fn missing_task_reports_error() {
     assert!(!output.status.success(), "未知任务应失败：{text}");
     assert!(text.contains("不存在任务"), "应说明原因：{text}");
 }
+
+/// `mio init` 生成的 tsconfig 必须与运行语义对齐：运行期把每个文件都当 ES Module，
+/// 否则只有顶层 await、没有 import/export 的文件会被编辑器当脚本报错。
+#[test]
+fn init_generates_module_detection_force() {
+    let dir = workspace("init_tsconfig");
+
+    let output = run_mio(&dir, &["init"], &[]);
+    assert!(
+        output.status.success(),
+        "init 应成功：{}",
+        combined(&output)
+    );
+
+    let tsconfig =
+        std::fs::read_to_string(dir.join("tsconfig.json")).expect("应生成 tsconfig.json");
+    assert!(
+        tsconfig.contains("\"moduleDetection\": \"force\""),
+        "应强制按模块检查，顶层 await 才合法：{tsconfig}"
+    );
+}
+
+/// `mio init` 遵守「已存在不覆盖」：用户手改过的 tsconfig 必须原样保留。
+#[test]
+fn init_keeps_existing_tsconfig() {
+    let dir = workspace("init_keep");
+    write(&dir, "tsconfig.json", "{ /* 用户自己的配置 */ }\n");
+
+    let output = run_mio(&dir, &["init"], &[]);
+    assert!(
+        output.status.success(),
+        "init 应成功：{}",
+        combined(&output)
+    );
+
+    let tsconfig =
+        std::fs::read_to_string(dir.join("tsconfig.json")).expect("应保留 tsconfig.json");
+    assert!(
+        tsconfig.contains("用户自己的配置"),
+        "不应覆盖已有配置：{tsconfig}"
+    );
+}
