@@ -25,7 +25,7 @@ features:
     details: serve(handler, options) 直接起 HTTP/HTTPS 服务，同步或异步 handler 都能工作，keep-alive 与并发连接已就绪。
   - icon: "04"
     title: 无包管理
-    details: 只有 ES Module。相对路径、Import Maps、@std/* 内建命名空间；不查 node_modules，不解析 package.json。
+    details: 只有 ES Module。相对路径、Import Maps、@std/* 内建命名空间，加上 import "https://…" 远程模块；不查 node_modules，不解析 package.json。
   - icon: "05"
     title: 编辑器有提示
     details: mio init 生成 .mio/@types/mio/ 与 tsconfig.json，任意 TypeScript LSP 都能识别全局与 @std 模块，无需专用插件。

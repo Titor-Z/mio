@@ -18,6 +18,31 @@ serve(async (req) => {
 serve(handler, { port: 443, cert: "...", key: "..." });
 ```
 
+## 🌐 远程模块导入
+
+```ts
+// 直接 import 远程 URL（Deno 风格）
+import { Hono } from "https://esm.sh/hono@4.6.14";
+
+// 也可以用 mio.json 的 imports 起别名
+// { "imports": { "@lib/": "https://esm.sh/hono@4.6.14/" } }
+import { Hono } from "@lib/";
+```
+
+```bash
+mio run app.ts            # 命中 ~/.mio/deps 缓存，不联网
+mio run app.ts --reload   # 强制重下全部远程模块
+mio run app.ts --reload=https://esm.sh/hono@4.6.14
+mio run app.ts --revalidate    # 条件请求，304 只刷新时间
+mio run app.ts --cached-only   # 严格离线
+mio run app.ts --no-remote     # 禁用远程导入
+mio run app.ts --frozen        # 只校验 mio.lock
+```
+
+- 缓存：`~/.mio/deps/<scheme>/<host>/<name>_<hash8>.{ts,json}`，清空用 `rm -rf ~/.mio/deps`。
+- 锁文件：`mio.lock` 默认生成（在 mio.json 所在目录），记录 URL → sha256，建议提交进 git。
+- `Request` 可自行构造：`new Request(url, { method, headers, body })`，`fetch(req)` 也支持。
+
 ## 📡 HTTP 客户端
 
 ```ts

@@ -109,6 +109,26 @@ serve(async (req) => {
 | `headers` | `Headers` | HTTP 头表 |
 | `body` | `ArrayBuffer \| null` | 请求体原始字节 |
 
+#### `Request` 也能自己构造
+
+`Request` 是标准全局构造器，`serve` 收到的对象与 `new Request(...)` 同类，`instanceof` 成立：
+
+```ts
+const req = new Request("https://example.com/api/users?page=1", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ name: "Alice" }),
+});
+
+req.url;                  // "https://example.com/api/users?page=1"
+req.method;               // "POST"
+req.headers.get("content-type");  // "application/json"
+req instanceof Request;   // true
+await req.clone().text(); // 体可复制后重复读取
+```
+
+> `input` 必须是绝对 URL（字符串或 `URL` 实例）或另一个 `Request`；相对地址按规范抛 `TypeError`。
+
 #### Headers API
 
 ```ts
@@ -135,6 +155,13 @@ return new Response("Error", { status: 500, statusText: "Server Error" });
 return new Response(uint8Array, { headers: { "Content-Type": "image/png" } });
 ```
 
+两个容易踩的点，mio 已按规范处理：
+
+- **字符串体自动带 `content-type`**：`new Response("hi")` 的 `headers.get("content-type")` 就是
+  `text/plain;charset=UTF-8`，不用手写。
+- **`res.headers` 是 live 视图**：构造之后 `res.headers.set("x-a", "1")` 会真的写进响应头，
+  所以「先建响应、后补头」也成立；`res.clone()` 复制状态、头与体，可独立读取。
+
 ### 3.2 HTTP 客户端 - `fetch()`
 
 mio 实现了 WHATWG Fetch API：
@@ -156,6 +183,13 @@ const controller = new AbortController();
 setTimeout(() => controller.abort(), 5000); // 5 秒超时
 
 const res = await fetch(url, { signal: controller.signal });
+
+// 也可以直接传 Request 实例
+const req = new Request("https://api.example.com/ping");
+const res = await fetch(req);
+res instanceof Response; // true —— fetch 返回的就是标准 Response
+const copy = res.clone(); // 复制后可以再读一次
+await copy.text();
 ```
 
 ### 3.3 其他 Web API
@@ -332,6 +366,81 @@ error("出错了");                    // 级别低于阈值时静默丢弃
 - 级别：`silent` / `error` / `warn` / `info` / `debug`，与 `mio.json` 的 `log.level` 同一套。
 - 初值来自配置（`mio.json` 或 `MIO_LOG_LEVEL`），脚本可用 `setLevel()` 覆盖；非法取值抛 `TypeError`。
 - `log.json: true` 时每行输出结构化 JSON：`{"level":"info","msg":"...","ts":1699999999999}`。
+
+### 3.12 从 URL 导入远程模块
+
+和 Deno 一样，`import` 可以直接写 URL，不需要任何前置步骤：
+
+```ts
+// Hono：直接用官方 CDN 上的版本
+import { Hono } from "https://esm.sh/hono@4.6.14";
+
+const app = new Hono();
+app.get("/", (c) => c.text("Hello Hono on mio!"));
+serve((req) => app.fetch(req), { port: 8787 });
+```
+
+本地入口也可以 import 远程模块，`mio.json` 的 `imports` 还能把别名指向 URL：
+
+```jsonc
+{
+  "imports": {
+    "@lib/": "https://esm.sh/hono@4.6.14/"
+  }
+}
+```
+
+```ts
+import { Hono } from "@lib/";   // 等价于上面的完整 URL
+```
+
+#### 缓存放在哪
+
+远程模块下载后落在 **`~/.mio/deps/`**（不可配置）：
+
+```
+~/.mio/deps/https/esm.sh/hono-base_2a3f7c19.ts
+~/.mio/deps/https/esm.sh/hono-base_2a3f7c19.json   # 元数据：url/status/etag/抓取时间/sha256
+```
+
+- 目录按 `<scheme>/<host>/` 分层，文件名带 8 位 URL 哈希，人可以直接 `ls` 排查。
+- 缓存**永久有效**：命中就直接用，永不主动联网，所以断网也能跑。
+- 想清空：`rm -rf ~/.mio/deps`。
+
+#### 什么时候去联网
+
+| 开关 | 行为 |
+|---|---|
+| （默认） | 命中缓存就用，不问网络 |
+| `--reload` | 全部远程模块重新下载 |
+| `--reload=<url>` | 只重下这一条 |
+| `--revalidate` | 带 `If-None-Match` / `If-Modified-Since` 问一次，304 只刷新时间 |
+| `--cached-only` | 严格离线：没缓存就报错 |
+| `--no-remote` | 禁用远程导入：遇到 URL 直接报错 |
+| `--frozen` | 只校验 `mio.lock`，不写入 |
+
+这些开关**只对 `mio run` 有效**；`mio check` 目前不支持远程导入（会明确报用法错误，不会静默忽略）。
+
+#### `mio.lock`：团队与 CI 的确定性
+
+第一次跑过远程模块后，mio 会在 `mio.json` 所在目录（无配置时是当前目录）自动生成 `mio.lock`：
+
+```json
+{
+  "version": 1,
+  "remote": {
+    "https://esm.sh/hono@4.6.14": "sha256-…",
+    "https://esm.sh/hono-base@4.6.14/es2022/hono-base.mjs": "sha256-…"
+  }
+}
+```
+
+- 只记「URL → 内容哈希」，不含时间戳、ETag、重定向终址——那些是会变的东西，进版本库只会制造 diff 噪音。
+- 建议**提交进 git**；CI 用 `mio run --frozen` 跑，上游内容变了会立即失败而不是静默换版本。
+- 上游确实升级了：去掉 `--frozen` 跑一次，锁文件自动更新。
+
+> 与 Deno 的差异：mio 没有 `npm:` 协议、不内置包管理，远程模块就是「URL 即模块身份」这一件事；
+> 也没有 TTL 自动过期——`--reload` 是唯一会主动换版本的开关。
 
 ## 4. 交互式 REPL
 

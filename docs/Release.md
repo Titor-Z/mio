@@ -7,6 +7,34 @@ TodoID 规则：`TD` + UUID。TaolunID 规则：`TL` + `YYYYMMDDThhmmss`。
 
 ---
 
+## 0.6.0（2026-11-23）
+
+**状态**：已发布。
+
+**更新内容**
+
+- 远程 URL 导入：`import "https://…"` 直接可用，支持本地入口 import 远程、`imports` 别名指向 URL、`mio run <url>` 跑远程入口。
+- 远程模块下载缓存：定死 `~/.mio/deps/<scheme>/<host>/<name>_<hash8>.{ts,json}`，原子写入，元数据含 etag/lastModified/fetchedAt/sha256，单模块上限 10 MiB；cache-first（命中即用、永不主动联网），`--reload` / `--reload=<url>` / `--revalidate` / `--cached-only` / `--no-remote` 显式控制。
+- `mio.lock` 默认生成（URL → sha256，键排序稳定、只记不可变事实），`--frozen` 只校验不写入，供 CI 保证确定性。
+- Web 标准对象对齐 W3C：`Request` 成为全局构造器（`new Request(input, init)`，`serve` 注入对象与之同类，`instanceof` 成立）；`Headers` / `Response` 迁为带原型的类；`Response.headers` 改为 live 视图；`new Response(字符串)` 自动补 `text/plain;charset=UTF-8`；`Response` 补 `clone()` / `type` / `redirected`。
+- 合并两套 Response：`fetch()` 返回标准 `Response`，`fetch()` 入参扩到 `string | URL | Request`；`serve(() => fetch(...))` 可直接写线。
+- 修复框架在 `await next()` 之后设置响应头不生效的问题（根因是 `Response.headers` 为快照拷贝）。
+- 类型声明与手册同步（新增「从 URL 导入远程模块」章节、兼容性表新增远程导入一行、`mio init` 示例补充提示）。
+
+**TodoLists[]**
+
+- TD617f415d0ea84c20973c90b8c1e1623b（远程 URL 导入与下载缓存）
+- TD74395b0e08ee47b8b61dfb78440e54cf（`mio.lock` 完整性校验）
+- TDb0ddb60903584af8a1a6803a2168d89c（Request 全局构造器 / Headers·Response 原型化）
+- TD17785f3a38fb4af0a49d95f8f9c75e84（合并两套 Response）
+
+**关联讨论**
+
+- TL20261123T053153（远程 URL 导入与下载缓存设计定稿）
+- TL20261123T060717（Web 标准对象对齐 W3C）
+
+---
+
 ## 0.5.0（2026-11-22）
 
 **状态**：已发布。

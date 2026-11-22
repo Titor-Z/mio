@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "boa_engine",
  "boa_gc",
@@ -1947,6 +1947,7 @@ dependencies = [
  "rustls-rustcrypto",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tsrs_execute",
  "url",
  "webpki-roots",

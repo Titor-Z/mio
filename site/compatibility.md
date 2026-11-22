@@ -6,7 +6,7 @@
 |---|---|---|---|---|
 | `fetch()` | ✅ | ⚠️ 18+ | ✅ | Node 需要 polyfill |
 | `Response` | ✅ | ❌ | ✅ | Node 无原生 Response |
-| `Request` | ✅ (serve only) | ❌ | ✅ | Node 有第三方库 |
+| `Request` | ✅ 可构造 | ❌ | ✅ | `new Request(...)`、`instanceof` 成立 |
 | `Headers` | ✅ | ❌ | ✅ | - |
 | `URL` | ✅ | ✅ | ✅ | WHATWG URL |
 | `Blob` | ✅ | ✅ | ✅ | - |
@@ -15,6 +15,7 @@
 | `TextDecoder` | ✅ | ✅ | ✅ | - |
 | `performance.now()` | ✅ | ✅ | ✅ | - |
 | `setTimeout` | ✅ | ✅ | ✅ | - |
+| 远程 URL 导入 | ✅ `import "https://…"` | ❌ | ✅ | mio 缓存到 `~/.mio/deps`，另有 `mio.lock` |
 
 ## 服务端开发
 
@@ -48,6 +49,18 @@
 | `process.env` | ❌ | ✅ | `Deno.env` |
 
 ## 运行时差异
+
+### 远程模块：URL 即模块身份
+
+```ts
+import { Hono } from "https://esm.sh/hono@4.6.14";
+```
+
+- 缓存位置定死 `~/.mio/deps/`，永久有效、命中即用、永不主动联网；`--reload` 才重下。
+- `mio.lock` 记录「URL → 内容哈希」，`--frozen` 供 CI 校验；它只记不可变事实，不含时间戳/ETag。
+- 与 Deno 的差异：**不内置 npm**（没有 `npm:` 协议、没有 `node_modules`）、不做 TTL 自动过期、
+  没有 `mio vendor`；`mio check` 暂不支持远程导入（类型检查侧只拿到缓存文件路径）。
+- 与 Bun 的差异：Bun 运行期不认 `https://` 说明符，远程代码要先经包管理器拉进 `node_modules`。
 
 ### DOM vs No DOM
 
