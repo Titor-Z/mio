@@ -26,7 +26,10 @@ use crate::web::net::server::{self as webhttp, ResponseSpec};
 
 use super::fetch::{self as engine_fetch, LoopEvent};
 use super::response;
-use super::support::{attach_method, global_static_function, set_property, to_text};
+use super::support::{
+    NativeMethod, global_static_function, instantiate, register_class, set_property, to_text,
+};
+use super::url as engine_url;
 
 /// 一条进来的请求：处理器序号 + 请求纯数据 + 回线发送端。
 pub(super) struct ServerInbound {
@@ -132,6 +135,8 @@ pub(super) fn install(context: &mut Context) {
     context
         .register_global_property(js_string!("serve"), function, Attribute::all())
         .expect("安装 serve 全局失败");
+
+    install_request(context);
 }
 
 /// 引擎线程处理一条进来的请求：调用 handler，同步 `Response` 直接回线，Promise 挂起待决。
@@ -217,36 +222,47 @@ pub(super) fn abandon_pending() {
     }
 }
 
-/// 从解析出的请求构造标准形态的 `Request`（method / url / headers / 异步体访问器）。
-///
-/// `url` 按 WHATWG 为绝对式；体已解析入内存，按序号登记，`text()`/`json()`/`arrayBuffer()`
-/// 经 `this._requestId` 回查（同 `Blob` 模式，Boa 0.22 无 `host_data` 可用）。
-fn build_request(request: &ParsedRequest, context: &mut Context) -> JsResult<JsValue> {
-    let head = &request.head;
-    let host = head.header("host").unwrap_or("localhost");
-    let target = if head.target.starts_with('/') {
-        head.target.clone()
-    } else {
-        format!("/{}", head.target)
-    };
-    let url = format!("http://{host}{target}");
+/// `Request.prototype` 上的方法表。
+const REQUEST_MEMBERS: &[(&str, NativeMethod)] = &[
+    ("text", request_text),
+    ("json", request_json),
+    ("arrayBuffer", request_array_buffer),
+    ("clone", request_clone),
+];
 
-    // 登记请求体，拿序号回指。
+/// 安装全局 `Request` 构造器（带原型，故 `req instanceof Request` 成立）。
+///
+/// serve 注入的对象与脚本侧 `new Request(...)` 走同一铸造路径，两条来源同类同形。
+pub(super) fn install_request(context: &mut Context) {
+    register_class(
+        context,
+        "Request",
+        build_request_constructor,
+        REQUEST_MEMBERS,
+    );
+}
+
+/// 登记一份请求体，返回回指序号。
+fn register_body(bytes: Vec<u8>) -> usize {
     let id = NEXT_BODY_ID.with(|cell| {
         let next = cell.get();
         cell.set(next + 1);
         next
     });
-    BODIES.with(|table| {
-        table.borrow_mut().push((
-            id,
-            RequestBody {
-                bytes: request.body.clone(),
-            },
-        ))
-    });
+    BODIES.with(|table| table.borrow_mut().push((id, RequestBody { bytes })));
+    id
+}
 
-    let object = JsObject::default(context.intrinsics());
+/// 以纯数据铸造一个 `Request` 实例（serve 与构造器共用）。
+fn request_object(
+    method: &str,
+    url: &str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    context: &mut Context,
+) -> JsResult<JsObject> {
+    let id = register_body(body);
+    let object = instantiate("Request", context)?;
     set_property(
         &object,
         js_string!("_requestId").into(),
@@ -256,16 +272,16 @@ fn build_request(request: &ParsedRequest, context: &mut Context) -> JsResult<JsV
     set_property(
         &object,
         js_string!("method").into(),
-        JsValue::from(js_string!(head.method.as_str())),
+        JsValue::from(js_string!(method)),
         context,
     );
     set_property(
         &object,
         js_string!("url").into(),
-        JsValue::from(js_string!(url.as_str())),
+        JsValue::from(js_string!(url)),
         context,
     );
-    let headers = response::new_headers(head.headers.clone(), context)?;
+    let headers = response::new_headers(headers, context)?;
     set_property(
         &object,
         js_string!("headers").into(),
@@ -273,12 +289,109 @@ fn build_request(request: &ParsedRequest, context: &mut Context) -> JsResult<JsV
         context,
     );
     set_property(&object, js_string!("body").into(), JsValue::null(), context);
+    Ok(object)
+}
 
-    for name in ["text", "json", "arrayBuffer"] {
-        attach_method(&object, name, request_method(name), context);
+/// 从解析出的服务端请求构造 `Request`（`url` 按 WHATWG 为绝对式）。
+fn build_request(request: &ParsedRequest, context: &mut Context) -> JsResult<JsValue> {
+    let head = &request.head;
+    let host = head.header("host").unwrap_or("localhost");
+    let target = if head.target.starts_with('/') {
+        head.target.clone()
+    } else {
+        format!("/{}", head.target)
+    };
+    let url = format!("http://{host}{target}");
+    let object = request_object(
+        &head.method,
+        &url,
+        head.headers.clone(),
+        request.body.clone(),
+        context,
+    )?;
+    Ok(object.into())
+}
+
+/// `new Request(input, init?)`。
+///
+/// `input` 可为绝对 URL 字符串、本实现 `URL` 实例，或另一个 `Request`（拷贝其
+/// method / headers / body）；`init` 在此基础上覆盖。
+fn build_request_constructor(context: &mut Context, args: &[JsValue]) -> JsResult<JsObject> {
+    let input = args.get_or_undefined(0);
+    let mut method = String::from("GET");
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+
+    let url = if let Some(text) = input.as_string() {
+        absolute_url(&text.to_std_string_escaped())?
+    } else if let Some(href) = engine_url::url_href(input, context)? {
+        absolute_url(&href)?
+    } else if let Some(object) = input.as_object() {
+        // 另一个本实现 Request：整体拷贝。
+        let id = object.get(js_string!("_requestId"), context)?;
+        let Some(id) = id.as_number() else {
+            return Err(JsNativeError::typ()
+                .with_message("Request input must be a string, URL, or Request")
+                .into());
+        };
+        let _ = id;
+        let url = to_text(&object.get(js_string!("url"), context)?, context)?;
+        method = to_text(&object.get(js_string!("method"), context)?, context)?;
+        let previous = object.get(js_string!("headers"), context)?;
+        headers = response::header_entries_from_init(&previous, context)?;
+        body = request_body(input, context)?.bytes;
+        url
+    } else {
+        return Err(JsNativeError::typ()
+            .with_message("Request input must be a string, URL, or Request")
+            .into());
+    };
+
+    if let Some(init) = args.get_or_undefined(1).as_object() {
+        let method_value = init.get(js_string!("method"), context)?;
+        if !method_value.is_undefined() && !method_value.is_null() {
+            method = to_text(&method_value, context)?.to_ascii_uppercase();
+        }
+        let headers_value = init.get(js_string!("headers"), context)?;
+        if !headers_value.is_undefined() && !headers_value.is_null() {
+            headers = response::header_entries_from_init(&headers_value, context)?;
+        }
+        let body_value = init.get(js_string!("body"), context)?;
+        if !body_value.is_undefined() && !body_value.is_null() {
+            body = response::body_to_bytes(&body_value, context)?;
+        }
     }
 
-    Ok(object.into())
+    request_object(&method, &url, headers, body, context)
+}
+
+/// 归一化绝对 URL；相对地址在 `new Request(...)` 中属于规范错误。
+fn absolute_url(raw: &str) -> JsResult<String> {
+    url::Url::parse(raw)
+        .map(|parsed| parsed.to_string())
+        .map_err(|_| {
+            JsNativeError::typ()
+                .with_message(format!(
+                    "Request input must be an absolute URL, got `{raw}`"
+                ))
+                .into()
+        })
+}
+
+/// `Request.prototype.clone()`：复制 method / url / headers / body。
+fn request_clone(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let Some(object) = this.as_object() else {
+        return Err(JsNativeError::typ()
+            .with_message("method must be called on Request")
+            .into());
+    };
+    let url = to_text(&object.get(js_string!("url"), context)?, context)?;
+    let method = to_text(&object.get(js_string!("method"), context)?, context)?;
+    let headers =
+        response::header_entries_from_init(&object.get(js_string!("headers"), context)?, context)?;
+    let body = request_body(this, context)?.bytes;
+    let clone = request_object(&method, &url, headers, body, context)?;
+    Ok(clone.into())
 }
 
 /// 取本实现 `Request` 的请求体字节；非本实现（无 `_requestId`）报错。
@@ -309,13 +422,15 @@ fn request_body(this: &JsValue, context: &mut Context) -> JsResult<RequestBody> 
     })
 }
 
-fn request_method(name: &str) -> fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue> {
-    match name {
-        "text" => request_text,
-        "json" => request_json,
-        "arrayBuffer" => request_array_buffer,
-        _ => unreachable!("未知的 request 方法"),
-    }
+/// 按登记序号取回请求体字节（供 `fetch(new Request(...))` 复用）。
+pub(super) fn registered_body(id: usize) -> Option<Vec<u8>> {
+    BODIES.with(|table| {
+        table
+            .borrow()
+            .iter()
+            .find(|(existing, _)| *existing == id)
+            .map(|(_, body)| body.bytes.clone())
+    })
 }
 
 /// `Request.text()`：已缓冲字节 → UTF-8 文本的已完成 Promise。

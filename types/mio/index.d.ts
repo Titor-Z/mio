@@ -180,15 +180,22 @@ declare class Response {
   readonly ok: boolean;
   readonly status: number;
   readonly statusText: string;
+  /** live 视图：`headers.set(...)` 会直接反映到 `serve` 写线的头。 */
   readonly headers: Headers;
+  /** 最终 URL；`fetch` 写入落地地址，`new Response` 为空串。 */
   readonly url: string;
+  /** 响应类型：`default`（本地构造）或 `basic`（`fetch` 产出）。 */
+  readonly type: string;
+  readonly redirected: boolean;
   arrayBuffer(): Promise<ArrayBuffer>;
   json(): Promise<any>;
   text(): Promise<string>;
+  /** 复制状态、头与体，新对象可独立读取。 */
+  clone(): Response;
 }
 
 // =========================
-// Request（仅由 serve 注入，不可自行构造）
+// Request（全局构造器；serve 注入的对象与 new Request(...) 同类）
 // =========================
 
 interface RequestInit {
@@ -199,7 +206,11 @@ interface RequestInit {
 }
 
 declare class Request {
-  private constructor();
+  /**
+   * `input` 须为绝对 URL、`URL` 实例，或另一个 `Request`（拷贝其 method/headers/body）。
+   * 相对地址属于规范错误。
+   */
+  constructor(input: string | URL | Request, init?: RequestInit);
   readonly method: string;
   readonly url: string;
   readonly headers: Headers;
@@ -207,6 +218,8 @@ declare class Request {
   arrayBuffer(): Promise<ArrayBuffer>;
   text(): Promise<string>;
   json(): Promise<any>;
+  /** 复制 method / url / headers / body。 */
+  clone(): Request;
 }
 
 // =========================
@@ -236,18 +249,13 @@ interface FetchRequestInit {
   signal?: AbortSignal;
 }
 
-interface FetchResponse {
-  readonly url: string;
-  readonly status: number;
-  readonly statusText: string;
-  readonly ok: boolean;
-  readonly headers: Headers;
-  text(): Promise<string>;
-  json(): Promise<any>;
-  arrayBuffer(): Promise<ArrayBuffer>;
-}
+/** `fetch` 的返回值就是全局 `Response`：`instanceof Response` 成立，方法集完全一致。 */
+type FetchResponse = Response;
 
-declare function fetch(url: string, init?: FetchRequestInit): Promise<FetchResponse>;
+declare function fetch(
+  input: string | URL | Request,
+  init?: FetchRequestInit,
+): Promise<FetchResponse>;
 
 // =========================
 // Serve（mio 特有）

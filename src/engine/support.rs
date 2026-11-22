@@ -1,12 +1,26 @@
 //! Web 全局绑定层的共享工具：属性挂载、字符串强制转换、数组迭代器桥接。
 //!
 //! 这些是 Boa 宿主侧的胶水，无规范语义，供 `url` / `blob` / `fetch` 等绑定复用。
+//!
+//! W3C 对齐：本文件还负责「带原型的全局构造器」注册。带原型的类使
+//! `x instanceof X` 与 `Object.prototype.toString.call(x)` 成立，方法挂在原型上
+//! 而非逐实例复制；旧的零原型 [`register_constructor`] 保留给尚未迁移的类。
 
-use boa_engine::JsString;
+use std::cell::RefCell;
+
+use boa_engine::builtins::object::OrdinaryObject;
 use boa_engine::object::FunctionObjectBuilder;
 use boa_engine::object::builtins::JsFunction;
 use boa_engine::property::{Attribute, PropertyDescriptor, PropertyKey};
-use boa_engine::{Context, JsNativeError, JsObject, JsResult, JsValue, js_string};
+use boa_engine::{
+    Context, JsNativeError, JsObject, JsResult, JsString, JsSymbol, JsValue, js_string,
+};
+
+thread_local! {
+    /// 已注册原型的类：类名 → 原型对象。工厂铸造实例时据此取 `[[Prototype]]`。
+    static PROTOTYPES: RefCell<rustc_hash::FxHashMap<&'static str, JsObject>> =
+        RefCell::new(rustc_hash::FxHashMap::default());
+}
 
 /// 挂载一个数据属性（可写、可枚举、可配置——duck-typed 全局对象的统一形态）。
 pub(super) fn set_property(
@@ -96,6 +110,113 @@ pub(super) fn register_constructor(
     context
         .register_global_property(js_string!(name), function, Attribute::all())
         .expect("安装全局构造器失败");
+}
+
+/// 注册一个**带原型**的全局构造器（W3C 对齐形态）。
+///
+/// 与 [`register_constructor`] 的差别：实例由 [`instantiate`] 用同一个原型铸造，
+/// 因此 `x instanceof X` 成立、`Object.prototype.toString.call(x)` 得到 `[object X]`；
+/// 方法挂在原型上，不再逐实例复制。
+///
+/// `members` 为「成员名 → 方法」，按不可枚举、可写、可配置的属性挂到原型上。
+pub(super) fn register_class(
+    context: &mut Context,
+    name: &'static str,
+    build: fn(&mut Context, &[JsValue]) -> JsResult<JsObject>,
+    members: &[(&'static str, NativeMethod)],
+) {
+    let prototype = JsObject::with_object_proto(context.intrinsics());
+
+    for (member, method) in members {
+        let function = FunctionObjectBuilder::new(
+            context.realm(),
+            boa_engine::NativeFunction::from_fn_ptr(*method),
+        )
+        .name(js_string!(*member))
+        .build();
+        let _ = prototype.insert_property(js_string!(*member), member_descriptor(function.into()));
+    }
+    let _ = prototype.insert_property(
+        JsSymbol::to_string_tag(),
+        member_descriptor(JsValue::from(js_string!(name))),
+    );
+
+    // 构造器本身：返回工厂铸造的对象（原生构造器返回对象时即以该对象为结果）。
+    let constructor = boa_engine::NativeFunction::from_copy_closure(move |_this, args, context| {
+        Ok(JsValue::from(build(context, args)?))
+    });
+    let function = FunctionObjectBuilder::new(context.realm(), constructor)
+        .name(js_string!(name))
+        .constructor(true)
+        .build();
+
+    // 原型与构造器互指，并把函数的 `prototype` 钉成不可改写的规范形态。
+    let _ = prototype.insert_property(
+        js_string!("constructor"),
+        member_descriptor(JsValue::from(function.clone())),
+    );
+    let function_object: JsObject = function.clone().into();
+    let _ = function_object.insert_property(
+        js_string!("prototype"),
+        PropertyDescriptor::builder()
+            .value(prototype.clone())
+            .writable(false)
+            .enumerable(false)
+            .configurable(false)
+            .build(),
+    );
+
+    PROTOTYPES.with(|table| {
+        table.borrow_mut().insert(name, prototype);
+    });
+
+    context
+        .register_global_property(js_string!(name), function, Attribute::all())
+        .expect("安装全局构造器失败");
+}
+
+/// 用已注册原型的类铸造一个普通实例（`ObjectCreate(X.prototype)`）。
+///
+/// 调用方随后自行挂载内部字段（如 `_headersId`）。
+pub(super) fn instantiate(name: &'static str, context: &mut Context) -> JsResult<JsObject> {
+    let prototype = PROTOTYPES.with(|table| table.borrow().get(name).cloned());
+    let Some(prototype) = prototype else {
+        return Err(JsNativeError::typ()
+            .with_message(format!("类 `{name}` 尚未注册原型"))
+            .into());
+    };
+    let _ = context;
+    Ok(JsObject::from_proto_and_data(
+        Some(prototype),
+        OrdinaryObject,
+    ))
+}
+
+/// 取已注册类的原型对象（已在安装阶段挂好成员）。
+pub(super) fn prototype_of(name: &'static str) -> Option<JsObject> {
+    PROTOTYPES.with(|table| table.borrow().get(name).cloned())
+}
+
+/// 把原型上已有的命名方法再挂到一个符号键上（如 `[Symbol.iterator]` 复用 `entries`）。
+pub(super) fn alias_symbol_member(
+    prototype: &JsObject,
+    symbol: JsSymbol,
+    member: &str,
+    context: &mut Context,
+) {
+    if let Ok(value) = prototype.get(js_string!(member), context) {
+        let _ = prototype.insert_property(symbol, member_descriptor(value));
+    }
+}
+
+/// 原型成员的标准属性描述符：不可枚举、可写、可配置。
+fn member_descriptor(value: JsValue) -> PropertyDescriptor {
+    PropertyDescriptor::builder()
+        .value(value)
+        .writable(true)
+        .enumerable(false)
+        .configurable(true)
+        .build()
 }
 
 /// 一个导出方法的签名，与 `NativeFunction::from_fn_ptr` 一致。

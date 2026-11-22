@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use boa_engine::object::FunctionObjectBuilder;
 use boa_engine::object::builtins::{JsArrayBuffer, JsFunction, JsPromise, JsUint8Array};
-use boa_engine::property::{Attribute, PropertyDescriptor, PropertyKey};
+use boa_engine::property::{Attribute, PropertyKey};
 use boa_engine::{
     Context, JsArgs, JsNativeError, JsObject, JsResult, JsValue, NativeFunction, js_string,
 };
@@ -120,6 +120,32 @@ pub(super) fn sender() -> Option<Sender<LoopEvent>> {
     SENDER.with(|slot| slot.borrow().clone())
 }
 
+/// 从本实现 `Request` 实例读出一份纯数据请求（`fetch(new Request(...))`）。
+fn request_from_request_object(
+    object: &JsObject,
+    id: usize,
+    context: &mut Context,
+) -> JsResult<webfetch::FetchRequest> {
+    let url = super::support::to_text(&object.get(js_string!("url"), context)?, context)?;
+    let mut request = webfetch::FetchRequest::new(url);
+
+    let method = object.get(js_string!("method"), context)?;
+    if let Some(method) = method.as_string() {
+        request.method = method.to_std_string_escaped().to_ascii_uppercase();
+    }
+
+    // `Request.headers` 是 `Headers` 实例，复用同一份 HeadersInit 解析。
+    let headers = object.get(js_string!("headers"), context)?;
+    request.headers = super::response::header_entries_from_init(&headers, context)?;
+
+    // 体：按 `_requestId` 回查登记表。
+    let body = super::http::registered_body(id).unwrap_or_default();
+    if !body.is_empty() {
+        request.body = Some(body);
+    }
+    Ok(request)
+}
+
 /// `parse_request` 的产出：纯数据请求 + 取消关联信息。
 struct ParsedRequest {
     request: webfetch::FetchRequest,
@@ -135,19 +161,26 @@ struct ParsedRequest {
 /// `body`（字符串或 Uint8Array）/ `signal`（本实现创建的 AbortSignal）。
 /// 不支持数组对形式的 headers 与 ReadableStream body（留待后续）。
 fn parse_request(args: &[JsValue], context: &mut Context) -> JsResult<ParsedRequest> {
-    // 入参接受字符串或本实现铸造的 URL 实例（读 href 快照）。
-    let url = match args.get_or_undefined(0).as_string() {
-        Some(string) => string.to_std_string_escaped(),
-        None => match engine_url::url_href(args.get_or_undefined(0), context)? {
-            Some(href) => href,
-            None => {
-                return Err(JsNativeError::typ()
-                    .with_message("fetch() expects a string URL or URL instance")
-                    .into());
-            }
-        },
+    // 入参接受字符串、本实现 URL 实例，或本实现 Request 实例（后者带 method/headers/body）。
+    let input = args.get_or_undefined(0);
+    let mut request = if let Some(object) = input.as_object()
+        && let Some(id) = object.get(js_string!("_requestId"), context)?.as_number()
+    {
+        request_from_request_object(&object, id as usize, context)?
+    } else {
+        let url = match input.as_string() {
+            Some(string) => string.to_std_string_escaped(),
+            None => match engine_url::url_href(input, context)? {
+                Some(href) => href,
+                None => {
+                    return Err(JsNativeError::typ()
+                        .with_message("fetch() expects a string URL, URL, or Request instance")
+                        .into());
+                }
+            },
+        };
+        webfetch::FetchRequest::new(url)
     };
-    let mut request = webfetch::FetchRequest::new(url);
     let mut signal_id = None;
     let mut aborted = false;
 
@@ -297,12 +330,11 @@ pub(super) fn settle(results: &[FetchResult], context: &mut Context) {
             continue;
         };
         let call = match outcome {
-            Ok(data) => {
-                let response = build_response(data, context);
+            Ok(data) => build_response(data, context).and_then(|response| {
                 pending
                     .resolve
                     .call(&JsValue::undefined(), &[response], context)
-            }
+            }),
             Err(message) => {
                 let error = JsNativeError::typ()
                     .with_message(message.clone())
@@ -437,71 +469,7 @@ fn reject_signal_pending(id: usize, context: &mut Context) {
 /// 把 [`ResponseData`] 翻译为 JS `Response` 对象（duck-typed，v1 不设原型链）。
 ///
 /// 体数据以 `_text` 字符串与 `_bytes`（Uint8Array）双形式承载；`text()` / `json()` /
-/// `arrayBuffer()` 通过 `this` 读取自身属性，因此全部是无需捕获的函数指针。
-/// 注：`arrayBuffer()` 返回共享底层缓冲的同一个视图（规范应每次副本，v1 取舍）。
-fn build_response(data: &ResponseData, context: &mut Context) -> JsValue {
-    let response = JsObject::default(context.intrinsics());
-    set_property(
-        &response,
-        js_string!("url"),
-        JsValue::from(js_string!(data.url.as_str())),
-        context,
-    );
-    set_property(
-        &response,
-        js_string!("status"),
-        JsValue::from(u32::from(data.status)),
-        context,
-    );
-    set_property(
-        &response,
-        js_string!("statusText"),
-        JsValue::from(js_string!(data.status_text.as_str())),
-        context,
-    );
-    set_property(
-        &response,
-        js_string!("ok"),
-        JsValue::from(data.is_ok()),
-        context,
-    );
-    set_property(
-        &response,
-        js_string!("_text"),
-        JsValue::from(js_string!(data.body_text().as_str())),
-        context,
-    );
-    // typed array 构造仅可能在内存耗尽时失败：降级为不设 _bytes（arrayBuffer 得 undefined）。
-    if let Ok(bytes) = JsUint8Array::from_iter(data.body.clone(), context) {
-        set_property(&response, js_string!("_bytes"), bytes.into(), context);
-    }
-
-    let headers = build_headers(data, context);
-    set_property(&response, js_string!("headers"), headers, context);
-
-    attach_method(&response, "text", text_method, context);
-    attach_method(&response, "json", json_method, context);
-    attach_method(&response, "arrayBuffer", array_buffer_method, context);
-
-    response.into()
-}
-
-/// 构造 `Headers` 视图：小写键直接挂在对象上，`get` / `has` 走 `this` 查找。
-fn build_headers(data: &ResponseData, context: &mut Context) -> JsValue {
-    let headers = JsObject::default(context.intrinsics());
-    for (name, value) in &data.headers {
-        set_property(
-            &headers,
-            js_string!(name.as_str()),
-            JsValue::from(js_string!(value.as_str())),
-            context,
-        );
-    }
-    attach_method(&headers, "get", header_get, context);
-    attach_method(&headers, "has", header_has, context);
-    headers.into()
-}
-
+/// 挂载一个数据属性（可写、可枚举、可配置）。
 fn set_property<K>(object: &JsObject, key: K, value: JsValue, context: &mut Context)
 where
     K: Into<PropertyKey>,
@@ -509,83 +477,20 @@ where
     let _ = object.create_data_property(key, value, context);
 }
 
-/// 以函数指针注册一个不可枚举的方法属性。
-fn attach_method(
-    object: &JsObject,
-    name: &str,
-    method: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
-    context: &mut Context,
-) {
-    let function = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(method))
-        .name(js_string!(name))
-        .build();
-    let descriptor = PropertyDescriptor::builder()
-        .value(function)
-        .writable(true)
-        .enumerable(false)
-        .configurable(true)
-        .build();
-    object.insert_property(js_string!(name), descriptor);
-}
-
-/// `Response.text()`：body 已在内存，直接返回已完成的 Promise。
-fn text_method(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let body = read_internal_text(this, context)?;
-    Ok(JsPromise::resolve(body, context)?.into())
-}
-
-/// `Response.json()`：用宿主 `JSON.parse` 解析内存 body。
-fn json_method(this: &JsValue, _args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let body = read_internal_text(this, context)?;
-    let parse = global_static_function(context, "JSON", "parse")?;
-    let json = context.global_object().get(js_string!("JSON"), context)?;
-    let parsed = parse.call(&json, &[body], context)?;
-    Ok(JsPromise::resolve(parsed, context)?.into())
-}
-
-/// `Response.arrayBuffer()`：返回承载 body 的 `Uint8Array`（约定 1：二进制 → Uint8Array）。
-fn array_buffer_method(
-    this: &JsValue,
-    _args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
-    let Some(object) = this.as_object() else {
-        return Err(JsNativeError::typ()
-            .with_message("method must be called on Response")
-            .into());
-    };
-    let bytes = object.get(js_string!("_bytes"), context)?;
-    Ok(JsPromise::resolve(bytes, context)?.into())
-}
-
-fn read_internal_text(this: &JsValue, context: &mut Context) -> JsResult<JsValue> {
-    let Some(object) = this.as_object() else {
-        return Err(JsNativeError::typ()
-            .with_message("method must be called on Response")
-            .into());
-    };
-    object.get(js_string!("_text"), context)
-}
-
-/// `Headers.get(name)`：缺失返回 `null`（WHATWG 语义）。
-fn header_get(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let Some(name) = args.get_or_undefined(0).as_string() else {
-        return Ok(JsValue::null());
-    };
-    let key = name.to_std_string_escaped().to_ascii_lowercase();
-    let Some(object) = this.as_object() else {
-        return Ok(JsValue::null());
-    };
-    let value = object.get(js_string!(key.as_str()), context)?;
-    Ok(if value.is_undefined() {
-        JsValue::null()
-    } else {
-        value
-    })
-}
-
-/// `Headers.has(name)`。
-fn header_has(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
-    let value = header_get(this, args, context)?;
-    Ok(JsValue::from(!value.is_null()))
+/// 把 [`ResponseData`] 翻译为全局 `Response` 实例。
+///
+/// 走 `response` 模块的同一铸造入口，因此 `fetch()` 的返回值与 `new Response(...)`
+/// 是同一个类：`instanceof Response` 成立、`headers` 具备完整方法与 live 语义、
+/// `serve(() => fetch(...))` 能直接写线。
+fn build_response(data: &ResponseData, context: &mut Context) -> JsResult<JsValue> {
+    let object = super::response::new_response_object(
+        data.status,
+        &data.status_text,
+        data.headers.clone(),
+        data.body.clone(),
+        &data.url,
+        "basic",
+        context,
+    )?;
+    Ok(object.into())
 }

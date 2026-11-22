@@ -72,6 +72,10 @@ const TSCONFIG: &str = r#"{
 /// 初始化生成的入口示例。
 const MAIN_TS: &str = r#"const message: string = "Hello, mio!";
 console.log(message);
+
+// 下一步可以试试：
+//   起一个 HTTP 服务：serve((req) => new Response("hi"), { port: 4173 });
+//   直接 import 远程模块：import { Hono } from "https://esm.sh/hono@4.6.14";
 "#;
 
 /// `.gitignore` 初始内容：类型声明应提交，故默认不忽略任何目录。

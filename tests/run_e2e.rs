@@ -2203,3 +2203,138 @@ fn check_knows_extra_std_modules() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn w3c_web_classes_are_real_constructors() {
+    let dir = unique_dir("w3c-classes");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        // 覆盖：全局构造器、instanceof、toStringTag、字符串体自动 content-type、
+        // headers 为 live 视图、clone 独立可读、Headers 迭代协议。
+        "const req = new Request('https://example.com/a?b=1', { method: 'post', headers: { 'x-a': '1' }, body: 'hi' });\n\
+         console.log(req.url, req.method, req.headers.get('x-a'), req instanceof Request);\n\
+         console.log(Object.prototype.toString.call(req), req.clone() instanceof Request, req.clone().method);\n\
+         const res = new Response('hi');\n\
+         console.log(res.headers.get('content-type'), res instanceof Response, Object.prototype.toString.call(res));\n\
+         res.headers.set('x-live', '1');\n\
+         console.log(res.headers.get('x-live'), await res.clone().text(), res.status);\n\
+         const h = new Headers([['a', '1'], ['b', '2']]);\n\
+         console.log([...h].map(([k, v]) => k + '=' + v).join(','), h instanceof Headers);\n",
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "W3C 类用例应成功退出：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout.trim(),
+        "https://example.com/a?b=1 POST 1 true
+[object Request] true POST
+text/plain;charset=UTF-8 true [object Response]
+1 hi 200
+a=1,b=2 true"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fetch_accepts_request_instance_and_returns_response() {
+    let port = spawn_mock_server();
+    let dir = unique_dir("fetch-request");
+    let file = dir.join("app.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "const req = new Request('http://127.0.0.1:{port}/hello', {{ method: 'GET' }});\n\
+             const r = await fetch(req);\n\
+             console.log(r instanceof Response, Object.prototype.toString.call(r), r.status, r.headers.get('x-mio'), await r.text());\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run(&["run", file.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "fetch(Request) 应成功：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout.trim(),
+        "true [object Response] 200 ok, again hello mio"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn serve_receives_request_instance_and_live_headers() {
+    // 与 `serve_responds_to_real_http_request` 区分端口，避免并行测试互撞。
+    let port: u16 = 18100;
+    let dir = unique_dir("serve-live");
+    let file = dir.join("server.ts");
+    std::fs::write(
+        &file,
+        format!(
+            "serve((req) => {{\n\
+             const res = new Response('isReq:' + (req instanceof Request), {{ status: 201 }});\n\
+             res.headers.set('x-added-after', '1');\n\
+             return res;\n\
+             }}, {{ port: {port} }});\n"
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(mio_binary())
+        .args(["run", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("启动 mio 服务器进程");
+
+    let mut client = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let out = child.wait_with_output().expect("回收已退出的子进程");
+                    panic!(
+                        "serve 进程提前退出（{status}）：stdout={} stderr={}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+
+    assert!(response.contains("201"), "状态应为 201：{response}");
+    assert!(
+        response.contains("x-added-after: 1"),
+        "构造后设置的响应头应写线（live headers）：{response}"
+    );
+    assert!(
+        response.contains("isReq:true"),
+        "应收到 Request 实例：{response}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    std::fs::remove_dir_all(&dir).ok();
+}
