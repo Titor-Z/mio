@@ -145,6 +145,12 @@ impl ModuleResolver {
         if path.is_absolute() {
             return Ok(path.to_path_buf());
         }
+        if target.starts_with("http://") || target.starts_with("https://") {
+            // URL 目标由远程层（下载缓存）处理，不会走到磁盘解析；走到这里说明调用方漏了分支。
+            return Err(ResolveError::new(format!(
+                "远程模块 `{target}` 需由下载缓存层处理"
+            )));
+        }
         if target.starts_with('@') {
             // 内建命名空间需要 stdlib 接入，本增量尚未提供，明确报错而非误指向磁盘。
             return Err(ResolveError::new(format!(

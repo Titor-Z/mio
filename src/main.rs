@@ -53,7 +53,10 @@ fn load_config(cli: &Cli) -> Result<LoadedConfig, String> {
 
 /// 推导配置文件查找的起始目录。
 fn entry_directory(cli: &Cli) -> PathBuf {
-    let entry = cli.command.entry_path();
+    let entry = cli.command.entry_path().filter(|path| {
+        // 入口是远程 URL 时没有本地目录可查，配置发现退回当前工作目录。
+        mio::loader::remote::remote_url(&path.to_string_lossy()).is_none()
+    });
     let directory = entry
         .and_then(|path| path.parent())
         .filter(|parent| !parent.as_os_str().is_empty())

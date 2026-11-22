@@ -261,6 +261,8 @@ impl MioConfig {
             || specifier.starts_with("../")
             || specifier.starts_with('/')
             || specifier.starts_with("file:")
+            || specifier.starts_with("http://")
+            || specifier.starts_with("https://")
             || specifier.starts_with("@std/"))
     }
 
@@ -365,6 +367,22 @@ mod tests {
 
         let error = config.build_resolver().expect_err("应拒绝斜杠不一致");
         assert!(error.contains("必须同时以 / 结尾"));
+    }
+
+    #[test]
+    fn resolver_accepts_url_target() {
+        // A 层：`imports` 的目标可以是远程 URL，不得被当作裸包名拒绝。
+        let mut config = MioConfig::default();
+        config.imports.insert(
+            String::from("@lib/"),
+            String::from("https://esm.example.com/lib/"),
+        );
+
+        let resolver = config.build_resolver().expect("URL 目标应合法");
+        assert_eq!(
+            resolver.rewrite("@lib/mod.ts"),
+            "https://esm.example.com/lib/mod.ts"
+        );
     }
 
     #[test]

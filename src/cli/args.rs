@@ -70,6 +70,43 @@ impl Command {
     }
 }
 
+/// 远程导入的重下模式，对应 `--reload` 与 `--reload=<url>`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadFlag {
+    /// 全量重下。
+    All,
+    /// 仅重下指定 URL。
+    Url(String),
+}
+
+/// 远程导入相关的命令行开关。
+///
+/// 这些开关**不进配置文件**：它们是「这一次运行怎么取模块」的选择，不是项目属性。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteFlags {
+    /// 重下模式；`None` 表示缓存优先、永不主动问网络。
+    pub reload: Option<ReloadFlag>,
+    /// 走条件请求（`If-None-Match` / `If-Modified-Since`）。
+    pub revalidate: bool,
+    /// 离线严格：未命中缓存即报错。
+    pub cached_only: bool,
+    /// 禁用远程导入：遇 URL 说明符直接报错。
+    pub no_remote: bool,
+    /// 只校验 `mio.lock` 不写入。
+    pub frozen: bool,
+}
+
+impl RemoteFlags {
+    /// 是否携带任一远程开关（用于拒绝非 run/check 子命令上的误用）。
+    fn any(&self) -> bool {
+        self.reload.is_some()
+            || self.revalidate
+            || self.cached_only
+            || self.no_remote
+            || self.frozen
+    }
+}
+
 /// 一次完整的命令行调用：命令本体 + 需要覆盖配置的选项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
@@ -81,6 +118,9 @@ pub struct Cli {
 
     /// 需要叠加到配置上的命令行覆盖项。
     pub overrides: ConfigOverride,
+
+    /// 远程导入开关。
+    pub remote: RemoteFlags,
 }
 
 impl Cli {
@@ -96,6 +136,7 @@ impl Cli {
         let mut positional: Vec<String> = Vec::new();
         let mut config_path: Option<PathBuf> = None;
         let mut overrides = ConfigOverride::default();
+        let mut remote = RemoteFlags::default();
         let mut early: Option<Command> = None;
         // `build` 专用选项：在循环里先收集，再由 resolve_command 校验「只在 build 下合法」。
         let mut build_out: Option<PathBuf> = None;
@@ -118,6 +159,19 @@ impl Cli {
                     cursor += 1;
                 }
                 "--emit-obj" => build_emit_obj = true,
+                // 远程导入开关（只对 run / check 有意义，见 resolve_command 后的校验）。
+                "--reload" => remote.reload = Some(ReloadFlag::All),
+                "--revalidate" => remote.revalidate = true,
+                "--cached-only" => remote.cached_only = true,
+                "--no-remote" => remote.no_remote = true,
+                "--frozen" => remote.frozen = true,
+                flag if flag.starts_with("--reload=") => {
+                    let url = flag.strip_prefix("--reload=").unwrap_or_default();
+                    if url.is_empty() {
+                        return Err(String::from("--reload= 需要一个 URL 参数"));
+                    }
+                    remote.reload = Some(ReloadFlag::Url(url.to_string()));
+                }
                 "--config" | "-c" => {
                     let value = words
                         .get(cursor + 1)
@@ -138,10 +192,18 @@ impl Cli {
             build_out,
             build_emit_obj,
         )?);
+        // 远程开关只对 run 有意义：类型检查侧尚未接通远程解析，静默忽略等于谎报能力。
+        let allows_remote = matches!(command, Command::Run { .. });
+        if remote.any() && !allows_remote {
+            return Err(String::from(
+                "选项 --reload / --revalidate / --cached-only / --no-remote / --frozen 只能用于 run 子命令",
+            ));
+        }
         Ok(Self {
             command,
             config_path,
             overrides,
+            remote,
         })
     }
 
@@ -276,6 +338,27 @@ mod tests {
     fn rejects_build_without_path() {
         let err = Cli::parse(["build"]).expect_err("应报错");
         assert!(err.contains("需要一个文件路径"));
+    }
+
+    #[test]
+    fn parses_remote_flags() {
+        let cli = Cli::parse(["run", "app.ts", "--reload"]).expect("应解析成功");
+        assert_eq!(cli.remote.reload, Some(ReloadFlag::All));
+
+        let cli = Cli::parse(["run", "app.ts", "--reload=https://a.com/x.ts"]).expect("应解析成功");
+        assert_eq!(
+            cli.remote.reload,
+            Some(ReloadFlag::Url(String::from("https://a.com/x.ts")))
+        );
+
+        let cli = Cli::parse(["run", "app.ts", "--frozen", "--cached-only"]).unwrap();
+        assert!(cli.remote.frozen && cli.remote.cached_only);
+    }
+
+    #[test]
+    fn rejects_remote_flags_on_other_commands() {
+        let err = Cli::parse(["init", "--reload"]).expect_err("应报错");
+        assert!(err.contains("只能用于 run 子命令"));
     }
 
     #[test]

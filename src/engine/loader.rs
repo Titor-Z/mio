@@ -10,7 +10,7 @@
 //! 另一类是 `@std/*` 内建模块：不读文件，而是把 [`crate::stdlib`] 里的纯 Rust 实现（引擎无关）
 //! 装配为 Boa 合成模块（synthetic module）。这是引擎侧的包装职责，`boa_*` 因此仍只在本模块出现。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -21,17 +21,27 @@ use boa_engine::{
     Context, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction, Source, js_string,
 };
 
+use crate::loader::RemoteCache;
 use crate::resolver::ModuleResolver;
 use crate::sourcemap::{SourceMapEntry, SourceMapRegistry, remap_stack};
 use crate::transpiler::{TranspileConfig, Transpiler};
 
 /// 携带转译步骤与路径缓存的模块加载器。
-#[derive(Default)]
 pub struct TsModuleLoader {
     cache: RefCell<rustc_hash::FxHashMap<PathBuf, Module>>,
     resolver: ModuleResolver,
     transpile: TranspileConfig,
     registry: RefCell<SourceMapRegistry>,
+    /// 远程下载缓存；`None` 表示本次运行不允许远程导入。
+    remote: RefCell<Option<Rc<RemoteCache>>>,
+    /// 远程导入是否被显式禁用（`--no-remote`），用于给出准确的报错。
+    remote_disabled: Cell<bool>,
+}
+
+impl Default for TsModuleLoader {
+    fn default() -> Self {
+        Self::new(ModuleResolver::default(), TranspileConfig::default())
+    }
 }
 
 impl TsModuleLoader {
@@ -42,7 +52,19 @@ impl TsModuleLoader {
             resolver,
             transpile,
             registry: RefCell::new(SourceMapRegistry::default()),
+            remote: RefCell::new(None),
+            remote_disabled: Cell::new(false),
         }
+    }
+
+    /// 挂上远程下载缓存（构造后再挂，避开在引擎构造里多开一个参数）。
+    pub fn attach_remote(&self, remote: Rc<RemoteCache>) {
+        *self.remote.borrow_mut() = Some(remote);
+    }
+
+    /// 显式禁用远程导入（`--no-remote`）。
+    pub fn disable_remote(&self) {
+        self.remote_disabled.set(true);
     }
 
     /// 登记一份产物对应的源码映射（入口文件由引擎侧转译，映射在此汇入同一注册表）。
@@ -89,6 +111,35 @@ impl ModuleLoader for TsModuleLoader {
                 return self.load_builtin(builtin, context);
             }
 
+            // 远程导入：绝对 URL，或引用者本身是远程模块时的相对说明符。
+            // Import Maps 把别名映射到 URL 的情形也在此处命中（rewritten 已是 URL）。
+            let remote = self.remote.borrow().clone();
+            if let Some((cache, url)) = remote.as_ref().and_then(|cache| {
+                cache
+                    .locate(&rewritten, referrer.path())
+                    .map(|url| (cache, url))
+            }) {
+                let path = cache
+                    .materialize(&url)
+                    .map_err(|message| JsNativeError::typ().with_message(message))?;
+                return self.load_file_at(&path, Some(&url), context);
+            }
+
+            // 未挂缓存但说明符就是 URL：区分「显式禁用」与「无法处理」两种原因。
+            if remote.is_none()
+                && let Some(url) = crate::loader::remote::remote_url(&rewritten)
+            {
+                return Err(if self.remote_disabled.get() {
+                    JsNativeError::typ()
+                        .with_message(format!("远程导入已被 `--no-remote` 禁用：{url}"))
+                        .into()
+                } else {
+                    JsNativeError::typ()
+                        .with_message(format!("无法加载远程模块：{url}"))
+                        .into()
+                });
+            }
+
             self.load_file(&specifier, referrer.path(), context)
         })();
 
@@ -110,38 +161,50 @@ impl TsModuleLoader {
             .map_err(|error| {
                 JsNativeError::typ().with_message(format!("模块解析失败 `{specifier}`：{error}"))
             })?;
+        self.load_file_at(&path, None, context)
+    }
 
-        if let Some(existing) = self.cache.borrow().get(&path) {
+    /// 加载指定路径的模块；`url` 为 `Some` 时它是远程模块，报错与来源标记用 URL 代替缓存路径。
+    fn load_file_at(
+        &self,
+        path: &Path,
+        url: Option<&str>,
+        context: &RefCell<&mut Context>,
+    ) -> JsResult<Module> {
+        if let Some(existing) = self.cache.borrow().get(path) {
             return Ok(existing.clone());
         }
 
-        let raw = std::fs::read_to_string(&path).map_err(|error| {
-            JsNativeError::typ().with_message(format!("无法读取 {}：{error}", path.display()))
+        // 远程模块的报错里不出现本地缓存路径，换成用户认得的 URL。
+        let label = url
+            .map(str::to_string)
+            .unwrap_or_else(|| path.display().to_string());
+
+        let raw = std::fs::read_to_string(path).map_err(|error| {
+            JsNativeError::typ().with_message(format!("无法读取 {label}：{error}"))
         })?;
 
-        let output =
-            Transpiler::transpile(&raw, &path, &self.transpile).map_err(|diagnostics| {
-                JsNativeError::syntax().with_message(format!(
-                    "转译 {} 失败：{}",
-                    path.display(),
-                    diagnostics.join("\n")
-                ))
-            })?;
+        let output = Transpiler::transpile(&raw, path, &self.transpile).map_err(|diagnostics| {
+            JsNativeError::syntax()
+                .with_message(format!("转译 {label} 失败：{}", diagnostics.join("\n")))
+        })?;
 
         if let Some(mapping) = output.sourcemap {
-            self.register_source_map(&path, mapping);
+            self.register_source_map(path, mapping);
         }
 
         let module = Module::parse(
-            Source::from_bytes(&output.code).with_path(&path),
+            Source::from_bytes(&output.code).with_path(path),
             None,
             &mut context.borrow_mut(),
         )
         .map_err(|error| {
-            JsNativeError::syntax().with_message(format!("解析 {} 失败：{error}", path.display()))
+            JsNativeError::syntax().with_message(format!("解析 {label} 失败：{error}"))
         })?;
 
-        self.cache.borrow_mut().insert(path, module.clone());
+        self.cache
+            .borrow_mut()
+            .insert(path.to_path_buf(), module.clone());
         Ok(module)
     }
 

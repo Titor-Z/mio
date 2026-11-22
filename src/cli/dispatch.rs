@@ -4,10 +4,15 @@
 //! 除版本、帮助与任务列表外的命令返回「尚未实现」提示，
 //! 后续步骤逐个替换为真实实现。
 
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
 use crate::cli::CliResult;
-use crate::cli::args::{Cli, Command};
+use crate::cli::args::{Cli, Command, ReloadFlag};
 use crate::config::LoadedConfig;
 use crate::engine::{BoaEngine, Engine};
+use crate::loader::remote::{Reload, remote_url};
+use crate::loader::{LOCK_FILE_NAME, RemoteCache, RemoteOptions};
 use crate::transpiler::{TranspileConfig, Transpiler};
 
 /// 帮助文本。面向使用者描述可用子命令，不含内部实现细节。
@@ -31,6 +36,12 @@ mio —— TypeScript 一等公民的运行时
       --emit-obj        build 只产出目标文件，不做链接
       --typecheck       本次执行前做类型检查
       --no-typecheck    本次执行前不做类型检查
+      --reload          强制重下全部远程模块（远程模块只在 run 下可用）
+      --reload=<url>    只重下指定 URL 的远程模块
+      --revalidate      远程模块走条件请求（304 只刷新时间）
+      --cached-only     远程模块严格离线，未缓存即报错
+      --no-remote       禁用远程导入，遇 URL 说明符直接报错
+      --frozen          只校验 mio.lock，不写入
   -v, --version         打印版本号
   -h, --help            打印本帮助
 ";
@@ -50,7 +61,7 @@ pub fn dispatch(cli: &Cli, config: &LoadedConfig) -> CliResult {
         Command::Init => super::scaffold::init_current_dir(),
         Command::Types => super::scaffold::refresh_types_current_dir(),
         Command::Docs { addr } => crate::docs::serve(addr.as_deref()),
-        Command::Run { path } => run_file(path, config),
+        Command::Run { path } => run_file(path, config, cli),
         Command::Eval { source } => eval_source(source),
         Command::Repl => super::repl::run(),
         Command::Check { path } => check_file(path, config),
@@ -164,7 +175,7 @@ fn check_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
 /// `mio.json` 的 `imports` 与配置目录会组装为 [`ModuleResolver`]，传给引擎后
 /// 内部的 `TsModuleLoader` 就能识别 Import Maps 别名与基准目录。
 /// 若配置 `check.typecheck == "on"`（或命令行 `--typecheck`），则先跑类型检查，任一诊断即中断。
-fn run_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
+fn run_file(path: &Path, config: &LoadedConfig, cli: &Cli) -> CliResult {
     if config.config.check.typecheck == "on" {
         check_file(path, config)?;
     }
@@ -177,12 +188,71 @@ fn run_file(path: &std::path::Path, config: &LoadedConfig) -> CliResult {
         target: Some(compiler.target.clone()),
         sourcemap: compiler.source_map,
     };
-    BoaEngine::with_transpile(resolver, transpile)
+
+    let remote = build_remote_cache(config, cli)?;
+    let engine = BoaEngine::with_transpile(resolver, transpile)
         .with_timeout(config.config.run.timeout_ms)
-        .with_log(&config.config.log.level, config.config.log.json)
-        .eval_module_file(path)
+        .with_log(&config.config.log.level, config.config.log.json);
+    let mut engine = match &remote {
+        Some(cache) => engine.with_remote(Rc::clone(cache)),
+        None => engine.without_remote(),
+    };
+
+    let entry = materialize_entry(path, remote.as_ref())?;
+    engine
+        .eval_module_file(&entry)
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    // 运行成功后才回写锁文件：失败的运行可能只加载了半个模块图，不应固化成契约。
+    if let Some(written) = engine.finish_remote().map_err(|error| error.to_string())? {
+        eprintln!(
+            "mio: 已更新 {}（记录本次用到的远程模块内容哈希）",
+            written.display()
+        );
+    }
+    Ok(())
+}
+
+/// 装配远程下载缓存；`--no-remote` 时返回 `None`（加载器据此拒绝 URL 说明符）。
+fn build_remote_cache(config: &LoadedConfig, cli: &Cli) -> Result<Option<Rc<RemoteCache>>, String> {
+    if cli.remote.no_remote {
+        return Ok(None);
+    }
+    let options = RemoteOptions {
+        reload: match &cli.remote.reload {
+            None => Reload::CacheFirst,
+            Some(ReloadFlag::All) => Reload::All,
+            Some(ReloadFlag::Url(url)) => Reload::Url(url.clone()),
+        },
+        revalidate: cli.remote.revalidate,
+        cached_only: cli.remote.cached_only,
+        frozen: cli.remote.frozen,
+        lock_path: Some(lock_file_path(config)),
+    };
+    let cache = RemoteCache::new(options)?;
+    Ok(Some(Rc::new(cache)))
+}
+
+/// `mio.lock` 的位置：有配置文件时用其所在目录，否则用当前工作目录。
+fn lock_file_path(config: &LoadedConfig) -> PathBuf {
+    let base = config
+        .source_path
+        .as_ref()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    base.join(LOCK_FILE_NAME)
+}
+
+/// 入口本身也可以是远程 URL：先物化到缓存，再交给引擎当普通文件加载。
+fn materialize_entry(path: &Path, remote: Option<&Rc<RemoteCache>>) -> Result<PathBuf, String> {
+    let Some(url) = remote_url(&path.to_string_lossy()) else {
+        return Ok(path.to_path_buf());
+    };
+    let Some(cache) = remote else {
+        return Err(format!("远程导入已被 `--no-remote` 禁用：{url}"));
+    };
+    cache.materialize(&url)
 }
 
 /// 执行一段内联源码：先按 TypeScript 转译擦除类型，再以脚本求值并回显非空结果。

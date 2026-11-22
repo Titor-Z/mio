@@ -9,7 +9,7 @@
 //! 入口模块预填入 [`TsModuleLoader`] 缓存，相对 `import` 经解析后递归转译加载；
 //! `@std/*` 内建模块与 `fetch`/`console`/定时器全局已接入。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,6 +30,7 @@ use super::http as engine_http;
 use super::loader::TsModuleLoader;
 use super::timers as engine_timers;
 use super::{Engine, EngineError};
+use crate::loader::RemoteCache;
 use crate::resolver::ModuleResolver;
 use crate::transpiler::{TranspileConfig, Transpiler};
 
@@ -44,6 +45,8 @@ pub struct BoaEngine {
     job_stop: StopKey,
     /// 本次运行的看门狗句柄；仅在 [`BoaEngine::evaluate`] 期间为 `Some`。
     budget: Option<WatchdogHandle>,
+    /// 远程下载缓存句柄（与加载器共享）；用于运行结束后回写 `mio.lock`。
+    remote: Option<Rc<RemoteCache>>,
 }
 
 impl Default for BoaEngine {
@@ -96,7 +99,33 @@ impl BoaEngine {
             timeout_ms: 30_000,
             job_stop,
             budget: None,
+            remote: None,
         }
+    }
+
+    /// 挂上远程下载缓存：加载器据此处理 `http(s)://` 说明符。
+    #[must_use]
+    pub fn with_remote(mut self, remote: Rc<RemoteCache>) -> Self {
+        self.loader.attach_remote(remote.clone());
+        self.remote = Some(remote);
+        self
+    }
+
+    /// 显式禁用远程导入（`--no-remote`）：遇 URL 说明符直接报错，不碰网络。
+    #[must_use]
+    pub fn without_remote(self) -> Self {
+        self.loader.disable_remote();
+        self
+    }
+
+    /// 把本次运行遇到的远程模块登记到 `mio.lock`；返回被写入的路径（未写为 `None`）。
+    pub fn finish_remote(&self) -> Result<Option<PathBuf>, EngineError> {
+        let Some(remote) = &self.remote else {
+            return Ok(None);
+        };
+        remote
+            .finish()
+            .map_err(|message| EngineError::new("锁文件", message))
     }
 
     /// 设置宿主事件循环的总预算（毫秒）：既是在途 fetch 的超时上限，

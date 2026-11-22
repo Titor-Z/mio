@@ -6,5 +6,9 @@
 //! 所有源码文件一律按 ES Module 语义加载，不依据扩展名或 `package.json` 判定。
 
 mod cache;
+mod lock;
+pub mod remote;
 
 pub use cache::ModuleCache;
+pub use lock::{LOCK_FILE_NAME, LockFile};
+pub use remote::{RemoteCache, RemoteOptions};
